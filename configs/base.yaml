@@ -1,0 +1,66 @@
+# Base configuration shared across all experiments.
+# Individual experiment configs override these values.
+
+model:
+  model_path: "/path/to/Qwen2.5-VL-7B-Instruct"   # SET THIS to local path
+  d_query: 256
+  num_perception_heads: 8
+  perception_residual: true
+  spatial_encoding_mode: "none"          # ablation: "none" | "additive_sincos2d" | "concat_sincos2d"
+  token_init_strategy: "mean_visual_text"
+  use_lora: false
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  lora_dropout: 0.05
+  freeze_vit: true
+  freeze_projector: true
+  freeze_llm: true
+  perception_dropout: 0.0
+  torch_dtype: "bfloat16"
+
+data:
+  data_path: "data/vgr_converted_train.jsonl"
+  eval_data_path: "data/vgr_converted_eval.jsonl"
+  image_root: null                       # SET THIS if images are not at absolute paths
+  max_seq_len: 2048
+  system_prompt: null
+  supervision_mode: "full"
+  num_workers: 4
+
+training:
+  output_dir: "runs/base"
+  experiment_name: "base"
+  num_epochs: 3
+  max_steps: -1
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
+  max_grad_norm: 1.0
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 50
+  lr_scheduler_type: "cosine"
+  do_warmup_stage: false
+  warmup_stage_steps: 200
+  warmup_lr: 5.0e-4
+  log_every_n_steps: 10
+  save_every_n_steps: 500
+  eval_every_n_steps: 500
+  save_total_limit: 3
+  bf16: true
+  gradient_checkpointing: true
+  debug_first_n_batches: 2
+  log_attn_weights_every: 200
+
+losses:
+  lambda_sft: 1.0
+  use_semantic_alignment: false
+  lambda_sem: 0.1
+  sem_proj_dim: 256
+  use_crop_alignment: false
+  lambda_crop: 0.05
+  crop_proj_dim: 256
+  use_grounding: false
+  lambda_ground: 0.1
+  grounding_temperature: 0.5
+  grounding_blur_sigma: 1.0

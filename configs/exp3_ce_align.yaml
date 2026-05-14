@@ -1,0 +1,22 @@
+# Experiment 3: CE + optional semantic alignment.
+# Hypothesis: Semantic alignment loss between z_perception and the embedding
+# of the observation text improves convergence or final accuracy when CE alone
+# provides insufficient gradient signal.
+# NOTE: requires pre-computed obs text embeddings in the dataset.
+
+defaults:
+  - base
+
+training:
+  output_dir: "runs/exp3_ce_align"
+  experiment_name: "exp3_ce_align"
+  num_epochs: 3
+  do_warmup_stage: false
+
+losses:
+  lambda_sft: 1.0
+  use_semantic_alignment: true
+  lambda_sem: 0.1
+  sem_proj_dim: 256
+  use_crop_alignment: false
+  use_grounding: false

@@ -1,0 +1,26 @@
+# Experiment 2: Short bbox warmup → CE-only.
+# Warmup stage: freeze LLM, train only perception module with L_ground (anti-collapse).
+# Main stage: switch off grounding, CE-only.
+# Hypothesis: A few hundred warmup steps prevent uniform attention collapse and
+# help CE gradients propagate more cleanly from the start.
+
+defaults:
+  - base
+
+training:
+  output_dir: "runs/exp2_warmup_ce"
+  experiment_name: "exp2_warmup_ce"
+  num_epochs: 3
+  do_warmup_stage: true
+  warmup_stage_steps: 200
+  warmup_lr: 5.0e-4
+
+losses:
+  lambda_sft: 1.0
+  use_semantic_alignment: false
+  use_crop_alignment: false
+  # Grounding is active ONLY during the warmup stage (trainer turns it off after)
+  use_grounding: true
+  lambda_ground: 0.3
+  grounding_temperature: 0.5
+  grounding_blur_sigma: 1.0

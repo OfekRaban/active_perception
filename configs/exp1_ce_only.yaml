@@ -1,0 +1,22 @@
+# Experiment 1: CE-only on converted VGR.
+# Hypothesis: CE on observation/replay text alone is sufficient to drive
+# gradient signal into z_perception, cross-attention, and the Query Adapter.
+# No auxiliary losses. Frozen LLM + ViT + projector. Train perception module only.
+
+defaults:
+  - base
+
+training:
+  output_dir: "runs/exp1_ce_only"
+  experiment_name: "exp1_ce_only"
+  num_epochs: 3
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 1.0e-4
+  do_warmup_stage: false
+
+losses:
+  lambda_sft: 1.0
+  use_semantic_alignment: false
+  use_crop_alignment: false
+  use_grounding: false
