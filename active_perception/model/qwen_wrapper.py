@@ -7,27 +7,37 @@ Core responsibility:
   3. Replace the N visual patch tokens in the LLM sequence with a single <IMAGE> token.
   4. Fix position_ids / M-RoPE after the reduction.
   5. Two-pass training forward:
-       Pass 1 (no-grad-on-backbone): run LLM → extract h_perception
-       Pass 2 (with grad): inject z_perception at <PERC_OUT>, run LLM → compute losses
+       Pass 1 (always no_grad): run LLM → extract h_perception
+       Pass 2 (with grad):      inject z_perception at <PERC_OUT>, run LLM → losses
   6. Inference with autoregressive generation and perception interception.
 
 M-RoPE notes:
   Qwen2.5-VL uses 3D position_ids [3, T] for M-RoPE (temporal, height, width).
-  Visual tokens get (t=0, h=row_idx, w=col_idx).
-  Text tokens get (t=pos, h=pos, w=pos).
+  When we replace N visual patch tokens with 1 <IMAGE> token, we recompute
+  position_ids for the entire modified sequence as sequential 1D text positions.
+  This breaks native visual-token RoPE but is intentional: spatial structure now
+  lives only in the external visual_memory, accessed via the perception cross-attn.
 
-  When we replace N visual patch tokens with 1 <IMAGE> token:
-  - We assign <IMAGE> the same 1D text-style position (t=p, h=p, w=p)
-    where p is the position of <|vision_start|> + 1 in the compressed sequence.
-  - Subsequent text tokens shift left by (N-1) positions.
-  - We RECOMPUTE position_ids for the entire modified sequence from scratch.
+Special token embeddings (Issue 4 fix):
+  The 3 new tokens (<IMAGE>, <PERCEPTION>, <PERC_OUT>) are registered as a
+  separate nn.Parameter `special_token_embeddings` [3, d_model] instead of
+  unfreezing the full 152k-row embedding table. Adam only tracks optimizer
+  states for these 3 rows (~10k params) rather than all 545M embedding params.
+  The embedding table stays fully frozen. The _embed() helper injects the
+  learnable rows at forward time by overwriting positions where input_ids
+  equals one of the 3 special token IDs.
 
-  This breaks the model's visual-token RoPE assumption but is intentional:
-  the visual spatial structure now lives only in the external visual_memory,
-  accessed via the perception cross-attention.
+Pass 1 no_grad (Issue 3 fix):
+  Pass 1 (h_perception extraction) always runs under torch.no_grad(),
+  unconditionally. This treats h_perception as a stop-gradient input to the
+  PerceptionModule — analogous to how RAG/RETRO treat the retrieval step.
+  In Stage 3 (LoRA), LoRA gradients still flow through Pass 2 (which uses
+  the same LLM weights), so the gradient truncation has negligible empirical
+  impact while eliminating the double-graph OOM risk (~20GB saved at 7B).
 """
 from __future__ import annotations
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,10 +57,10 @@ class ActivePerceptionConfig:
     # ── Model paths ──────────────────────────────────────────────────────────
     model_path: str = "/path/to/Qwen2.5-VL-7B-Instruct"
     # ── Architecture ─────────────────────────────────────────────────────────
-    d_query: int = 256                          # bottleneck dim in QueryAdapter
-    num_perception_heads: int = 8               # cross-attn heads in PerceptionModule
-    perception_residual: bool = True            # add h_perception residual to z
-    spatial_encoding_mode: str = "none"         # "none" | "additive_sincos2d" | "concat_sincos2d"
+    d_query: int = 256
+    num_perception_heads: int = 8
+    perception_residual: bool = True
+    spatial_encoding_mode: str = "none"
     # ── Special token initialization ─────────────────────────────────────────
     token_init_strategy: str = "mean_visual_text"
     # ── LoRA ─────────────────────────────────────────────────────────────────
@@ -64,11 +74,11 @@ class ActivePerceptionConfig:
     # ── Freezing ─────────────────────────────────────────────────────────────
     freeze_vit: bool = True
     freeze_projector: bool = True
-    freeze_llm: bool = True           # True in stage 1+2; False (or LoRA) in stage 3
+    freeze_llm: bool = True
     # ── Training ─────────────────────────────────────────────────────────────
     perception_dropout: float = 0.0
     # ── Dtype ────────────────────────────────────────────────────────────────
-    torch_dtype: str = "bfloat16"     # "bfloat16" | "float16" | "float32"
+    torch_dtype: str = "bfloat16"
 
 
 class ActivePerceptionModel(nn.Module):
@@ -81,17 +91,31 @@ class ActivePerceptionModel(nn.Module):
         self.config = config
         self.dtype = getattr(torch, config.torch_dtype)
 
-        # ── Load base model and tokenizer ────────────────────────────────────
+        # ── Load base model and processor ────────────────────────────────────
         logger.info(f"[ActivePerception] Loading base model from {config.model_path}")
         self.base_model, self.processor = self._load_base_model(config.model_path)
         self.tokenizer = self.processor.tokenizer
 
-        # ── Add special tokens ───────────────────────────────────────────────
+        # ── Add special tokens (initializes new embedding rows in the table) ─
         logger.info("[ActivePerception] Adding special tokens")
         self.special_tokens = add_special_tokens_to_model(
             self.base_model, self.tokenizer, config.token_init_strategy
         )
         logger.info(f"[ActivePerception] {self.special_tokens}")
+
+        # ── Learnable special token embeddings (Issue 4 fix) ─────────────────
+        # Extract initialized values from the embedding table, then freeze the
+        # table. Only these 3 rows are trainable, via an external Parameter.
+        # Adam stores optimizer states for ~10k params instead of ~545M.
+        embed = self.base_model.get_input_embeddings()
+        new_ids = [
+            self.special_tokens.IMAGE,
+            self.special_tokens.PERCEPTION,
+            self.special_tokens.PERC_OUT,
+        ]
+        with torch.no_grad():
+            init_embeds = embed.weight.data[new_ids].clone().float()  # float32 for optimizer stability
+        self.special_token_embeddings = nn.Parameter(init_embeds)  # [3, d_model]
 
         # ── Cache important token IDs ─────────────────────────────────────────
         self.image_pad_id = self._find_image_pad_id()
@@ -108,16 +132,21 @@ class ActivePerceptionModel(nn.Module):
             residual=config.perception_residual,
         )
 
-        # ── Spatial encoding for visual memory ───────────────────────────────
+        # ── Spatial encoding (Issue 2 fix: pass merge_size from model config) ─
+        merge_size = getattr(
+            self.base_model.config.vision_config, "spatial_merge_size", 2
+        )
         self.spatial_encoding = SpatialEncoding2D(
             d_model=d_llm,
             mode=SpatialEncodingMode(config.spatial_encoding_mode),
+            merge_size=merge_size,
         )
+        logger.info(f"[ActivePerception] Vision merger spatial_merge_size={merge_size}")
 
-        # ── Apply freezing ───────────────────────────────────────────────────
+        # ── Apply freezing ────────────────────────────────────────────────────
         self._apply_freezing()
 
-        # ── Optional LoRA ────────────────────────────────────────────────────
+        # ── Optional LoRA ─────────────────────────────────────────────────────
         if config.use_lora:
             self._apply_lora()
 
@@ -131,14 +160,13 @@ class ActivePerceptionModel(nn.Module):
         try:
             from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
         except ImportError:
-            # Older transformers uses different class name
             from transformers import Qwen2VLForConditionalGeneration as Qwen2_5_VLForConditionalGeneration
             from transformers import AutoProcessor
 
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_path,
             torch_dtype=self.dtype,
-            device_map=None,    # caller handles device placement
+            device_map=None,
             local_files_only=True,
         )
         processor = AutoProcessor.from_pretrained(
@@ -154,13 +182,17 @@ class ActivePerceptionModel(nn.Module):
     def _apply_freezing(self):
         cfg = self.config
 
+        # Always freeze the full embedding table (Issue 4 fix).
+        # Special tokens are trained via self.special_token_embeddings (nn.Parameter).
+        self.base_model.get_input_embeddings().weight.requires_grad_(False)
+        logger.info("[ActivePerception] Embedding table frozen; special tokens via external Parameter")
+
         if cfg.freeze_vit:
             for p in self.base_model.visual.parameters():
                 p.requires_grad_(False)
             logger.info("[ActivePerception] ViT frozen")
 
         if cfg.freeze_projector:
-            # Freeze the visual merger (MLP projector) in Qwen2.5-VL
             if hasattr(self.base_model.visual, "merger"):
                 for p in self.base_model.visual.merger.parameters():
                     p.requires_grad_(False)
@@ -171,25 +203,7 @@ class ActivePerceptionModel(nn.Module):
                 p.requires_grad_(False)
             for p in self.base_model.lm_head.parameters():
                 p.requires_grad_(False)
-            # Unfreeze new special token embeddings
-            self._unfreeze_new_token_embeddings()
-            logger.info("[ActivePerception] LLM frozen (special token embeddings unfrozen)")
-
-    def _unfreeze_new_token_embeddings(self):
-        """Keep gradient flow through the new token embeddings even when LLM is frozen."""
-        embed = self.base_model.get_input_embeddings()
-        new_ids = [
-            self.special_tokens.IMAGE,
-            self.special_tokens.PERCEPTION,
-            self.special_tokens.PERC_OUT,
-        ]
-        # We can't selectively unfreeze embedding rows easily in PyTorch.
-        # Strategy: unfreeze the whole embedding layer; gradients from frozen
-        # tokens will be zero (they don't appear in the output).
-        embed.weight.requires_grad_(True)
-        logger.info(
-            f"[ActivePerception] Embedding layer unfrozen for token IDs: {new_ids}"
-        )
+            logger.info("[ActivePerception] LLM frozen")
 
     def _apply_lora(self):
         try:
@@ -208,8 +222,7 @@ class ActivePerceptionModel(nn.Module):
         self.base_model = get_peft_model(self.base_model, lora_config)
         logger.info(
             f"[ActivePerception] LoRA applied: r={self.config.lora_rank}, "
-            f"alpha={self.config.lora_alpha}, "
-            f"targets={self.config.lora_target_modules}"
+            f"alpha={self.config.lora_alpha}, targets={self.config.lora_target_modules}"
         )
 
     def _log_trainable_params(self):
@@ -217,8 +230,42 @@ class ActivePerceptionModel(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(
             f"[ActivePerception] Parameters: total={total/1e6:.1f}M, "
-            f"trainable={trainable/1e6:.1f}M ({100*trainable/total:.2f}%)"
+            f"trainable={trainable/1e6:.2f}M ({100*trainable/total:.3f}%)"
         )
+
+    # =========================================================================
+    # Embedding helper (Issue 4 fix)
+    # =========================================================================
+
+    def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Embed input_ids using the frozen embedding table, then inject the 3
+        learnable special-token embeddings at positions where input_ids equals
+        IMAGE, PERCEPTION, or PERC_OUT.
+
+        The frozen table handles all 152k vocab tokens; only the 3 special rows
+        are overwritten with values from self.special_token_embeddings (float32
+        Parameter, cast to model dtype at injection).
+        """
+        embeds = self.base_model.get_input_embeddings()(input_ids)  # [..., T, D]
+
+        tids = [
+            self.special_tokens.IMAGE,
+            self.special_tokens.PERCEPTION,
+            self.special_tokens.PERC_OUT,
+        ]
+        # Fast path: skip clone if no special tokens present
+        if not any((input_ids == tid).any() for tid in tids):
+            return embeds
+
+        embeds = embeds.clone()
+        for i, tid in enumerate(tids):
+            mask = (input_ids == tid)
+            if mask.any():
+                embeds[mask] = self.special_token_embeddings[i].to(
+                    dtype=embeds.dtype, device=embeds.device
+                )
+        return embeds
 
     # =========================================================================
     # Visual memory encoding
@@ -231,16 +278,14 @@ class ActivePerceptionModel(nn.Module):
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Run ViT + projector and return projected visual tokens.
-        These are stored as the external visual memory (NOT put in LLM context).
+        Run ViT + projector and return post-merger visual tokens as external memory.
 
         Returns:
-            visual_memory: [N_patches, D_llm]
+            visual_memory: [N_actual, D_llm]
+            where N_actual = (H // merge_size) * (W // merge_size)
         """
         pixel_values = pixel_values.to(self.dtype)
-        # Qwen2.5-VL visual encoder
         visual_out = self.base_model.visual(pixel_values, grid_thw=grid_thw)
-        # visual_out: [N_patches, D_llm] (after the merger/projector inside .visual)
         return visual_out.detach()
 
     # =========================================================================
@@ -249,9 +294,9 @@ class ActivePerceptionModel(nn.Module):
 
     def build_modified_sequence(
         self,
-        input_ids: torch.Tensor,        # [B, T_orig]
-        attention_mask: torch.Tensor,   # [B, T_orig]
-        labels: torch.Tensor,           # [B, T_orig]
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
         debug: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -259,15 +304,12 @@ class ActivePerceptionModel(nn.Module):
         Recomputes position_ids for the M-RoPE-consistent modified sequence.
 
         Returns:
-            mod_input_ids:     [B, T_new]
-            mod_attention_mask:[B, T_new]
-            mod_labels:        [B, T_new]
-            position_ids:      [B, 3, T_new]  (M-RoPE 3D positions)
+            mod_input_ids:      [B, T_new]
+            mod_attention_mask: [B, T_new]
+            mod_labels:         [B, T_new]
+            position_ids:       [B, 3, T_new]
         """
         B, T_orig = input_ids.shape
-
-        if debug:
-            logger.debug(f"[Surgery] Input shape: {input_ids.shape}")
 
         mod_ids_list, mod_mask_list, mod_labels_list, pos_ids_list = [], [], [], []
 
@@ -276,7 +318,6 @@ class ActivePerceptionModel(nn.Module):
             mask = attention_mask[b]
             lab = labels[b]
 
-            # Find image_pad positions
             if self.image_pad_id is not None:
                 pad_mask = (ids == self.image_pad_id)
                 n_pad = pad_mask.sum().item()
@@ -285,16 +326,11 @@ class ActivePerceptionModel(nn.Module):
                 n_pad = 0
 
             if n_pad == 0:
-                # No visual tokens; just add text-style position_ids
-                T = ids.shape[0]
                 new_ids = ids
                 new_mask = mask
                 new_lab = lab
             else:
-                # Replace all image_pad tokens with a single <IMAGE> token
-                # Keep everything except image_pad; insert <IMAGE> at first pad position
                 first_pad = pad_mask.nonzero(as_tuple=True)[0][0].item()
-
                 new_ids = torch.cat([
                     ids[:first_pad],
                     torch.tensor([self.special_tokens.IMAGE], dtype=ids.dtype, device=ids.device),
@@ -316,8 +352,8 @@ class ActivePerceptionModel(nn.Module):
             if debug:
                 logger.debug(
                     f"[Surgery] b={b}: T_orig={T_orig}, n_pad={n_pad}, T_new={T_new}, "
-                    f"PERCEPTION_positions={((new_ids == self.special_tokens.PERCEPTION).nonzero()).squeeze(-1).tolist()}, "
-                    f"PERC_OUT_positions={((new_ids == self.special_tokens.PERC_OUT).nonzero()).squeeze(-1).tolist()}"
+                    f"PERCEPTION_pos={((new_ids == self.special_tokens.PERCEPTION).nonzero()).squeeze(-1).tolist()}, "
+                    f"PERC_OUT_pos={((new_ids == self.special_tokens.PERC_OUT).nonzero()).squeeze(-1).tolist()}"
                 )
 
             pos_ids = self._compute_position_ids(new_ids, T_new, device=ids.device)
@@ -327,7 +363,6 @@ class ActivePerceptionModel(nn.Module):
             mod_labels_list.append(new_lab)
             pos_ids_list.append(pos_ids)
 
-        # Pad to same length within batch
         T_max = max(x.shape[0] for x in mod_ids_list)
         pad_id = self.tokenizer.pad_token_id or 0
 
@@ -340,7 +375,7 @@ class ActivePerceptionModel(nn.Module):
         mod_labels = torch.stack([pad_1d(x, T_max, -100) for x in mod_labels_list])
         position_ids = torch.stack([
             F.pad(p, (0, T_max - p.shape[1]), value=0) for p in pos_ids_list
-        ])  # [B, 3, T_max]
+        ])
 
         return mod_input_ids, mod_attention_mask, mod_labels, position_ids
 
@@ -348,15 +383,12 @@ class ActivePerceptionModel(nn.Module):
         self, ids: torch.Tensor, T: int, device: torch.device
     ) -> torch.Tensor:
         """
-        Compute 3D M-RoPE position IDs for the modified sequence.
-
-        For a purely text-like modified sequence (no image_pad tokens),
-        all 3 dims get the same sequential position value: [t, t, t] for t in 0..T-1.
-
+        Compute 3D M-RoPE position IDs for the modified (text-only) sequence.
+        All 3 dims get the same sequential value: [t, t, t] for t in 0..T-1.
         Returns: [3, T]
         """
         positions = torch.arange(T, device=device, dtype=torch.long)
-        return positions.unsqueeze(0).expand(3, -1).contiguous()  # [3, T]
+        return positions.unsqueeze(0).expand(3, -1).contiguous()
 
     # =========================================================================
     # Two-pass training forward
@@ -364,53 +396,56 @@ class ActivePerceptionModel(nn.Module):
 
     def training_forward(
         self,
-        input_ids: torch.Tensor,           # [B, T_orig] from collator
-        attention_mask: torch.Tensor,      # [B, T_orig]
-        labels: torch.Tensor,              # [B, T_orig]
-        pixel_values: torch.Tensor,        # from processor
-        image_grid_thw: torch.Tensor,      # [B, 3]
-        perc_positions: List[List[int]],   # per-sample list of PERCEPTION positions
-        perc_out_positions: List[List[int]],  # per-sample list of PERC_OUT positions
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        perc_positions: List[List[int]],
+        perc_out_positions: List[List[int]],
         debug: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Full two-pass training step.
 
-        Returns a dict with:
-          - logits           [B, T, V]
-          - hidden_states    tuple of all layer hidden states
-          - z_perceptions    list of [K, D] tensors per batch item
-          - attn_weights_list list of [K, N] tensors per batch item
-          - modified_input_ids [B, T_new] for debugging
-        """
-        # ── Step 1: Encode image → visual memory ────────────────────────────
-        visual_memory = self.encode_image_to_memory(pixel_values, image_grid_thw)
-        # visual_memory: [N, D]  (one image per batch item assumed for now)
-        # For multi-image batches, this needs to be split by grid_thw.
-        # Future: support batched visual memory with per-sample indexing.
+        Pass 1 (Issue 3 fix — always no_grad):
+          Run LLM to extract h_perception at <PERCEPTION> positions.
+          Treating this as stop-gradient avoids holding two full 7B computation
+          graphs simultaneously. LoRA gradients still reach the LLM weights
+          via Pass 2, so the truncation has negligible empirical impact.
 
-        # ── Step 2: Sequence surgery ─────────────────────────────────────────
+        Pass 2 (with grad):
+          Inject z_perception at <PERC_OUT> positions; run full LLM forward
+          for CE loss. Gradients flow: CE → LLM (Pass 2) → z_perception →
+          PerceptionModule → QueryAdapter → (stop at h_perception).
+
+        Returns dict with:
+          loss_ce, logits, z_perceptions, attn_weights_list,
+          modified_input_ids, modified_labels
+        """
+        # ── Step 1: Encode image → visual memory ─────────────────────────────
+        visual_memory = self.encode_image_to_memory(pixel_values, image_grid_thw)
+        # visual_memory: [N_actual, D]
+
+        # ── Step 2: Sequence surgery ──────────────────────────────────────────
         mod_ids, mod_mask, mod_labels, position_ids = self.build_modified_sequence(
             input_ids, attention_mask, labels, debug=debug
         )
-        # mod_ids: [B, T_new], image_pad tokens replaced by <IMAGE>
 
         B, T_new = mod_ids.shape
         device = mod_ids.device
 
-        # ── Step 3: Build base embeddings ────────────────────────────────────
-        base_embeds = self.base_model.get_input_embeddings()(mod_ids)  # [B, T_new, D]
-        # <PERC_OUT> embeddings will be replaced; zero them for pass 1
+        # ── Step 3: Build Pass 1 embeddings ──────────────────────────────────
+        base_embeds = self._embed(mod_ids)           # [B, T_new, D]
+        # Zero <PERC_OUT> embeddings so they don't influence h_perception
+        # (causal attn: <PERC_OUT> comes after <PERCEPTION>, but zero is safer)
         perc_out_id = self.special_tokens.PERC_OUT
-        perc_out_mask_2d = (mod_ids == perc_out_id)  # [B, T_new]
+        perc_out_mask_2d = (mod_ids == perc_out_id)
         base_embeds = base_embeds.clone()
         base_embeds[perc_out_mask_2d] = 0.0
 
-        # ── Pass 1: Extract h_perception ─────────────────────────────────────
-        # Since causal attention is used, h_perception at position t only
-        # depends on tokens 0..t, so <PERC_OUT>=0 does NOT affect h_perception
-        # (PERC_OUT comes AFTER PERCEPTION in the sequence).
-        with torch.no_grad() if self.config.freeze_llm else torch.enable_grad():
+        # ── Pass 1: Extract h_perception (Issue 3 fix: always no_grad) ───────
+        with torch.no_grad():
             pass1_out = self.base_model.model(
                 inputs_embeds=base_embeds,
                 attention_mask=mod_mask,
@@ -420,50 +455,42 @@ class ActivePerceptionModel(nn.Module):
             )
         hs_pass1 = pass1_out.last_hidden_state  # [B, T_new, D]
 
-        # ── Extract h_perception per batch item ───────────────────────────────
+        # ── Run PerceptionModule per batch item ───────────────────────────────
         z_perceptions = []
         attn_weights_list = []
 
-        # Apply spatial encoding to visual memory if configured
-        # (visual_memory is [N, D]; need [1, N, D] for batched cross-attn)
-        vm = visual_memory.unsqueeze(0)  # [1, N, D]
+        vm = visual_memory.unsqueeze(0)  # [1, N_actual, D]
         if self.config.spatial_encoding_mode != "none":
             vm = self.spatial_encoding(vm, image_grid_thw)
 
         for b in range(B):
-            b_perc_pos = perc_positions[b]  # positions in MODIFIED sequence
-            # Map original perc_positions to modified sequence positions
-            # (since we removed N_pad-1 tokens, positions shift)
-            # Actually, perc_positions from the collator are in the ORIGINAL sequence;
-            # we need to remap them. But the collator doesn't know about the surgery yet.
-            # Solution: recompute PERCEPTION positions from mod_ids directly.
-            b_perc_pos_mod = (mod_ids[b] == self.special_tokens.PERCEPTION).nonzero(
+            # Re-detect PERCEPTION positions in the modified (surgery-adjusted) sequence
+            b_perc_pos = (mod_ids[b] == self.special_tokens.PERCEPTION).nonzero(
                 as_tuple=True
             )[0].tolist()
 
-            if not b_perc_pos_mod:
+            if not b_perc_pos:
                 z_perceptions.append(None)
                 attn_weights_list.append(None)
                 continue
 
-            K = len(b_perc_pos_mod)
-            h_p = hs_pass1[b, b_perc_pos_mod, :]  # [K, D]
-            h_p_batched = h_p.unsqueeze(0)         # [1, K, D]
+            K = len(b_perc_pos)
+            h_p = hs_pass1[b, b_perc_pos, :]   # [K, D] — stop-gradient input
+            h_p_batched = h_p.unsqueeze(0)       # [1, K, D]
 
             z, attn_w = self.perception_module(
                 h_perception=h_p_batched,
                 visual_memory=vm,
                 return_attn_weights=True,
             )
-            z = z.squeeze(0)       # [K, D]
-            attn_w = attn_w.squeeze(0) if attn_w is not None else None  # [K, N]
+            z = z.squeeze(0)        # [K, D]
+            attn_w = attn_w.squeeze(0) if attn_w is not None else None
 
             z_perceptions.append(z)
             attn_weights_list.append(attn_w)
 
-        # ── Pass 2: Inject z_perception at <PERC_OUT> positions, full forward ─
-        embeds_pass2 = self.base_model.get_input_embeddings()(mod_ids).clone()
-        embeds_pass2 = embeds_pass2.to(self.dtype)
+        # ── Pass 2: Inject z_perception at <PERC_OUT>, full forward ──────────
+        embeds_pass2 = self._embed(mod_ids).to(self.dtype)
 
         for b in range(B):
             if z_perceptions[b] is None:
@@ -471,7 +498,7 @@ class ActivePerceptionModel(nn.Module):
             b_perc_out_pos = (mod_ids[b] == self.special_tokens.PERC_OUT).nonzero(
                 as_tuple=True
             )[0].tolist()
-            z = z_perceptions[b]  # [K, D]
+            z = z_perceptions[b]
             K = z.shape[0]
             assert len(b_perc_out_pos) == K, (
                 f"[TwoPass] b={b}: {len(b_perc_out_pos)} PERC_OUT positions "
@@ -520,26 +547,23 @@ class ActivePerceptionModel(nn.Module):
         When the model emits <PERCEPTION>:
           1. Extract h_perception from the current hidden state.
           2. Run perception module → z_perception.
-          3. Feed z_perception as the next token embedding (not as input_ids).
+          3. Feed z_perception as the next token embedding.
           4. Continue generation.
         """
         device = input_ids.device
 
-        # Encode image → visual memory
         visual_memory = self.encode_image_to_memory(pixel_values, image_grid_thw)
-        vm = visual_memory.unsqueeze(0)  # [1, N, D]
+        vm = visual_memory.unsqueeze(0)
         if self.config.spatial_encoding_mode != "none":
             vm = self.spatial_encoding(vm, image_grid_thw)
 
-        # Build modified sequence (no visual patch tokens)
-        labels_dummy = input_ids.clone()  # not used in generation
+        labels_dummy = input_ids.clone()
         mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids)
         mod_ids, mod_mask, _, position_ids = self.build_modified_sequence(
             input_ids, mask, labels_dummy
         )
 
-        # Get initial embeddings
-        current_embeds = self.base_model.get_input_embeddings()(mod_ids).to(self.dtype)
+        current_embeds = self._embed(mod_ids).to(self.dtype)
 
         generated_ids = []
         past_key_values = None
@@ -554,73 +578,65 @@ class ActivePerceptionModel(nn.Module):
                 use_cache=True,
                 output_hidden_states=True,
             )
-            hidden = out.last_hidden_state  # [B, T, D] or [B, 1, D] with cache
+            hidden = out.last_hidden_state
             past_key_values = out.past_key_values
 
-            # Get logits for the last position
-            logits = self.base_model.lm_head(hidden[:, -1:, :])  # [B, 1, V]
+            logits = self.base_model.lm_head(hidden[:, -1:, :])
 
             if do_sample and temperature != 1.0:
                 logits = logits / temperature
-            next_token_ids = logits[:, 0, :].argmax(dim=-1)  # [B]
+            next_token_ids = logits[:, 0, :].argmax(dim=-1)
 
-            # Check if any sequence emitted <PERCEPTION>
             perc_emitted = (next_token_ids == self.special_tokens.PERCEPTION)
 
             if perc_emitted.any():
-                # Handle perception for emitting sequences
-                # For simplicity, process all sequences (even non-emitting ones fall through)
-                h_perc = hidden[:, -1, :]  # [B, D]
+                h_perc = hidden[:, -1, :]
 
                 next_embeds_list = []
                 for b in range(input_ids.shape[0]):
                     if perc_emitted[b]:
-                        # Run perception module
                         z, _ = self.perception_module(
                             h_perception=h_perc[b:b+1].unsqueeze(1),
                             visual_memory=vm,
                         )
-                        # z: [1, 1, D] → [1, D]
                         next_embed = z.squeeze(1).to(self.dtype)
-                        # Record <PERCEPTION> then <PERC_OUT> in generated_ids
                         if len(generated_ids) <= step:
-                            generated_ids.append(torch.full((input_ids.shape[0],), -1, device=device))
+                            generated_ids.append(
+                                torch.full((input_ids.shape[0],), -1, device=device)
+                            )
                         generated_ids[step][b] = self.special_tokens.PERCEPTION
                         next_embeds_list.append(next_embed)
                     else:
-                        tok_embed = self.base_model.get_input_embeddings()(
-                            next_token_ids[b:b+1]
-                        ).to(self.dtype)
+                        tok_embed = self._embed(next_token_ids[b:b+1]).to(self.dtype)
                         next_embeds_list.append(tok_embed)
 
-                current_embeds = torch.stack([e.squeeze(0) for e in next_embeds_list], dim=0).unsqueeze(1)
+                current_embeds = torch.stack(
+                    [e.squeeze(0) for e in next_embeds_list], dim=0
+                ).unsqueeze(1)
             else:
-                # Normal token
                 if len(generated_ids) <= step:
                     generated_ids.append(next_token_ids)
                 else:
                     generated_ids[step] = next_token_ids
 
-                current_embeds = self.base_model.get_input_embeddings()(
-                    next_token_ids.unsqueeze(1)
-                ).to(self.dtype)
+                current_embeds = self._embed(next_token_ids.unsqueeze(1)).to(self.dtype)
 
-            # Update attention mask and position ids
             T_current = mod_mask.shape[1] + step + 1
-            new_mask_col = torch.ones(input_ids.shape[0], 1, dtype=mod_mask.dtype, device=device)
+            new_mask_col = torch.ones(
+                input_ids.shape[0], 1, dtype=mod_mask.dtype, device=device
+            )
             mod_mask = torch.cat([mod_mask, new_mask_col], dim=1)
 
-            new_pos = (current_pos_ids[:, :, -1:] + 1)
-            current_pos_ids = new_pos  # only last position needed with KV cache
+            new_pos = current_pos_ids[:, :, -1:] + 1
+            current_pos_ids = new_pos
 
-            # Check for EOS
             eos_id = self.tokenizer.eos_token_id
             if eos_id is not None and (next_token_ids == eos_id).all():
                 break
 
         if not generated_ids:
             return torch.zeros(input_ids.shape[0], 0, dtype=torch.long, device=device)
-        return torch.stack(generated_ids, dim=1)  # [B, T_gen]
+        return torch.stack(generated_ids, dim=1)
 
     # =========================================================================
     # Helpers
@@ -651,18 +667,26 @@ class ActivePerceptionModel(nn.Module):
         return self.special_tokens.as_dict()
 
     def save_perception_module(self, path: str):
-        """Save only the perception module weights (for stage checkpointing)."""
-        import os
+        """Save perception module, spatial encoding, and special token embeddings."""
         os.makedirs(path, exist_ok=True)
         torch.save(self.perception_module.state_dict(), f"{path}/perception_module.pt")
         torch.save(self.spatial_encoding.state_dict(), f"{path}/spatial_encoding.pt")
+        torch.save(self.special_token_embeddings.data, f"{path}/special_token_embeddings.pt")
         logger.info(f"[ActivePerception] Perception module saved to {path}")
 
     def load_perception_module(self, path: str):
-        """Load perception module weights from a checkpoint."""
-        perc_path = f"{path}/perception_module.pt"
+        """Load perception module, spatial encoding, and special token embeddings."""
+        self.perception_module.load_state_dict(
+            torch.load(f"{path}/perception_module.pt", map_location="cpu")
+        )
         spa_path = f"{path}/spatial_encoding.pt"
-        self.perception_module.load_state_dict(torch.load(perc_path, map_location="cpu"))
-        if hasattr(self.spatial_encoding, "proj"):
-            self.spatial_encoding.load_state_dict(torch.load(spa_path, map_location="cpu"))
+        if os.path.exists(spa_path) and hasattr(self.spatial_encoding, "proj"):
+            self.spatial_encoding.load_state_dict(
+                torch.load(spa_path, map_location="cpu")
+            )
+        sp_path = f"{path}/special_token_embeddings.pt"
+        if os.path.exists(sp_path):
+            self.special_token_embeddings.data.copy_(
+                torch.load(sp_path, map_location="cpu")
+            )
         logger.info(f"[ActivePerception] Perception module loaded from {path}")

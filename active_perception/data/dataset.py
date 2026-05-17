@@ -7,6 +7,14 @@ Key design:
 - Records positions of <PERCEPTION> and <PERC_OUT> tokens for the model wrapper
 - Supports multiple perception steps per sample
 - Supports future multi-dataset mixtures
+
+Prefix masking (Issue 1 fix):
+  Labels for user/system prefix tokens are set to -100 via a double-tokenize
+  strategy in _build_labels. The prompt prefix (system + user + image tokens,
+  including the trailing <|im_start|>assistant\n header) is re-tokenized
+  independently with add_generation_prompt=True to obtain the exact prefix length.
+  This avoids fragile token-ID searches and handles edge cases (missing system
+  prompt, variable image sizes) correctly.
 """
 from __future__ import annotations
 import json
@@ -27,19 +35,17 @@ class ActivePerceptionDataset(Dataset):
     """
     Loads ActivePerceptionSample records (from JSON/JSONL) and tokenizes them
     using the Qwen2.5-VL processor.
-
-    The dataset is processor-agnostic at storage time; tokenization happens here.
     """
 
     def __init__(
         self,
         data_path: str,
-        processor,                          # Qwen2.5-VL processor
-        special_token_ids: Dict[str, int],  # {"PERCEPTION": id, "PERC_OUT": id, "IMAGE": id}
+        processor,
+        special_token_ids: Dict[str, int],
         image_root: Optional[str] = None,
         max_seq_len: int = 2048,
         system_prompt: Optional[str] = None,
-        supervision_mode: str = "full",     # "full" | "obs_and_answer" | "answer_only"
+        supervision_mode: str = "full",
     ):
         self.processor = processor
         self.special_token_ids = special_token_ids
@@ -77,37 +83,31 @@ class ActivePerceptionDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.samples[idx]
 
-        # Load image
         image = self._load_image(sample.image)
         if image is None:
-            # Return a fallback — in practice log and skip
             logger.warning(f"[Dataset] Could not load image for sample {sample.id}")
             return self.__getitem__((idx + 1) % len(self.samples))
 
-        # Build conversation for processor
         messages = self._build_messages(sample)
 
-        # Tokenize with processor
         try:
             encoding = self._tokenize(messages, image)
         except Exception as e:
             logger.warning(f"[Dataset] Tokenization failed for {sample.id}: {e}")
             return self.__getitem__((idx + 1) % len(self.samples))
 
-        input_ids = encoding["input_ids"][0]        # [T]
-        attention_mask = encoding["attention_mask"][0]  # [T]
+        input_ids = encoding["input_ids"][0]
+        attention_mask = encoding["attention_mask"][0]
         pixel_values = encoding.get("pixel_values")
         image_grid_thw = encoding.get("image_grid_thw")
 
-        # Truncate if needed
         if input_ids.shape[0] > self.max_seq_len:
             input_ids = input_ids[:self.max_seq_len]
             attention_mask = attention_mask[:self.max_seq_len]
 
-        # Build labels
-        labels = self._build_labels(input_ids, sample)
+        # Build labels with correct prefix masking (Issue 1 fix: image passed through)
+        labels = self._build_labels(input_ids, sample, image)
 
-        # Find special token positions
         perc_positions = (input_ids == self.special_token_ids["PERCEPTION"]).nonzero(as_tuple=True)[0].tolist()
         perc_out_positions = (input_ids == self.special_token_ids["PERC_OUT"]).nonzero(as_tuple=True)[0].tolist()
 
@@ -122,7 +122,6 @@ class ActivePerceptionDataset(Dataset):
             "perc_out_positions": perc_out_positions,
             "num_perception_steps": sample.num_perception_steps(),
             "has_perception": sample.has_perception,
-            # Bbox metadata for optional supervision (not exposed to LLM)
             "bboxes": [s.bbox for s in sample.perception_steps if s.has_bbox()],
             "observation_texts": [s.observation_text for s in sample.perception_steps if s.has_observation()],
             "source": sample.source,
@@ -142,7 +141,7 @@ class ActivePerceptionDataset(Dataset):
             return None
 
     def _build_messages(self, sample: ActivePerceptionSample) -> List[Dict[str, Any]]:
-        """Build chat messages for the Qwen2.5-VL processor."""
+        """Build full chat messages (system + user + assistant) for the processor."""
         messages = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
@@ -159,6 +158,20 @@ class ActivePerceptionDataset(Dataset):
         })
         return messages
 
+    def _build_prompt_messages(self, sample: ActivePerceptionSample) -> List[Dict[str, Any]]:
+        """Build prompt-only messages (system + user, no assistant turn)."""
+        messages = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": sample.question},
+            ],
+        })
+        return messages
+
     def _tokenize(self, messages: List[Dict], image: Image.Image) -> Dict:
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
@@ -170,30 +183,67 @@ class ActivePerceptionDataset(Dataset):
             padding=False,
         )
 
+    def _compute_prefix_len(
+        self, sample: ActivePerceptionSample, image: Image.Image
+    ) -> int:
+        """
+        Return the number of tokens that belong to the prompt prefix
+        (system + user turn + image tokens + <|im_start|>assistant\\n header).
+
+        Strategy (Issue 1 fix): re-tokenize the prompt-only portion with
+        add_generation_prompt=True. Because the processor encodes the image
+        identically regardless of whether an assistant turn is present, the
+        resulting token count equals the exact prefix length in the full
+        conversation tokenization.
+
+        Falls back to masking 1 token on processor error (degenerate sample).
+        """
+        prompt_messages = self._build_prompt_messages(sample)
+        prompt_text = self.processor.apply_chat_template(
+            prompt_messages, tokenize=False, add_generation_prompt=True
+        )
+        try:
+            prompt_enc = self.processor(
+                text=[prompt_text],
+                images=[image],
+                return_tensors="pt",
+                padding=False,
+            )
+            return int(prompt_enc["input_ids"].shape[1])
+        except Exception as e:
+            logger.warning(
+                f"[Dataset] _compute_prefix_len failed for sample {sample.id}: {e}. "
+                "Falling back to masking first token only."
+            )
+            return 1
+
     def _build_labels(
-        self, input_ids: torch.Tensor, sample: ActivePerceptionSample
+        self,
+        input_ids: torch.Tensor,
+        sample: ActivePerceptionSample,
+        image: Image.Image,
     ) -> torch.Tensor:
         """
         Build per-token labels for CE loss.
 
-        Masking strategy:
-        - system + user tokens: -100 (no loss)
-        - <PERC_OUT> token: -100 (embedding is replaced by z_perception; no CE target)
-        - <IMAGE> token: -100
-        - <PERCEPTION> token: supervised (teach model WHEN to emit it)
-        - observation text + reasoning + answer: supervised (core gradient signal)
-
-        supervision_mode controls what gets supervised:
-        - "full": all assistant tokens except PERC_OUT and IMAGE
-        - "obs_and_answer": only observation text + answer
-        - "answer_only": only the final answer
+        Masking policy:
+          - All prompt prefix tokens (system, user, image pads, assistant header):
+            -100. Located via double-tokenize (see _compute_prefix_len).
+          - <PERC_OUT> positions: -100. Embedding is replaced by z_perception;
+            supervising these would teach the LLM to predict the perception token,
+            not the visual evidence.
+          - <IMAGE> positions: -100.
+          - All assistant response tokens including <PERCEPTION>: supervised.
+            The CE loss on <PERCEPTION> teaches the model WHEN to query;
+            the CE loss on observation/reasoning text provides the gradient
+            signal into the PerceptionModule via Pass 2.
         """
         labels = input_ids.clone()
 
-        # Mask all tokens by default; we'll unmask selectively
-        # For simplicity, find the boundary where the assistant response starts.
-        # The processor adds a special token or we can detect the first assistant token.
-        # We use a simpler heuristic: mask everything before the FIRST supervised token.
+        # Mask prompt prefix (Issue 1 fix)
+        prefix_len = self._compute_prefix_len(sample, image)
+        prefix_len = min(prefix_len, input_ids.shape[0])
+        labels[:prefix_len] = -100
 
         # Mask <PERC_OUT> always
         perc_out_id = self.special_token_ids.get("PERC_OUT")
@@ -204,15 +254,6 @@ class ActivePerceptionDataset(Dataset):
         image_id = self.special_token_ids.get("IMAGE")
         if image_id is not None:
             labels[input_ids == image_id] = -100
-
-        # Mask image pad tokens (original Qwen visual tokens) if any remain
-        # (shouldn't be present after our surgery, but defensive)
-        # image_pad_id is handled by the wrapper before reaching here
-
-        # NOTE: Full masking of user/system prefix is done in the collator
-        # based on the role boundaries. Here we just handle special tokens.
-        # For now, trust that the processor's tokenization puts user content
-        # before assistant content and the trainer handles prefix masking.
 
         return labels
 
@@ -225,23 +266,21 @@ class ActivePerceptionCollator:
     - Padding input_ids, attention_mask, labels to max length in batch
     - Stacking pixel_values (all images must be same resolution or pre-resized)
     - Collecting perception position lists per sample
-    - Optional: masking user/system tokens in labels (prefix masking)
+
+    Note: prefix masking of user/system tokens is done in the Dataset._build_labels
+    via double-tokenize; the collator receives already-masked label tensors.
     """
 
     def __init__(
         self,
         pad_token_id: int,
         image_token_id: Optional[int] = None,
-        mask_user_tokens_in_labels: bool = True,
     ):
         self.pad_token_id = pad_token_id
         self.image_token_id = image_token_id
-        self.mask_user_tokens_in_labels = mask_user_tokens_in_labels
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # Determine max sequence length in batch
         max_len = max(item["input_ids"].shape[0] for item in batch)
-        B = len(batch)
 
         input_ids_list = []
         attention_mask_list = []
@@ -264,11 +303,10 @@ class ActivePerceptionCollator:
                            torch.full((pad_len,), -100, dtype=torch.long)])
             )
 
-        input_ids = torch.stack(input_ids_list)       # [B, T]
-        attention_mask = torch.stack(attention_mask_list)  # [B, T]
-        labels = torch.stack(labels_list)             # [B, T]
+        input_ids = torch.stack(input_ids_list)
+        attention_mask = torch.stack(attention_mask_list)
+        labels = torch.stack(labels_list)
 
-        # Pixel values: stack if all have same shape, else keep as list
         pixel_values = self._collate_pixel_values(batch)
         image_grid_thw = self._collate_grid_thw(batch)
 
@@ -278,7 +316,6 @@ class ActivePerceptionCollator:
             "labels": labels,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
-            # Per-sample position lists (variable length; keep as list of lists)
             "perc_positions": [item["perc_positions"] for item in batch],
             "perc_out_positions": [item["perc_out_positions"] for item in batch],
             "bboxes": [item["bboxes"] for item in batch],
@@ -295,7 +332,7 @@ class ActivePerceptionCollator:
         try:
             return torch.cat(pvs, dim=0)
         except Exception:
-            return pvs  # can't stack; return list
+            return pvs
 
     def _collate_grid_thw(self, batch):
         gts = [item.get("image_grid_thw") for item in batch]

@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: active_perception
+Version: 0.1.0
+Summary: Active Perception via Latent External Visual Memory for MLLMs
+Requires-Python: >=3.9
+Requires-Dist: torch>=2.1.0
+Requires-Dist: transformers>=4.45.0
+Requires-Dist: Pillow>=9.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: pandas>=1.5
+Requires-Dist: pyarrow>=11.0
+Requires-Dist: tqdm>=4.65
+Provides-Extra: lora
+Requires-Dist: peft>=0.7.0; extra == "lora"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

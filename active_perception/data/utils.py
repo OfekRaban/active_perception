@@ -40,7 +40,7 @@ def crop_image(image, bbox: List[float], normalized: bool = False):
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     if x2 <= x1 or y2 <= y1:
-        return image  # degenerate bbox; return full image
+        return image
     return image.crop((x1, y1, x2, y2))
 
 
@@ -61,7 +61,7 @@ def bbox_to_patch_mask(
     Args:
         bbox: [x1, y1, x2, y2] in pixel or normalized coords
         image_hw: (H, W) of the original image in pixels
-        patch_grid_hw: (grid_H, grid_W) — number of patch rows/cols
+        patch_grid_hw: (grid_H, grid_W) — post-merger patch grid dimensions
         normalized: True if bbox is in [0,1]
         blur_sigma: if > 0, apply Gaussian blur to soften hard edges
 
@@ -76,7 +76,6 @@ def bbox_to_patch_mask(
     else:
         x1, y1, x2, y2 = bbox
 
-    # Convert bbox pixel coords → patch grid indices
     r0 = max(0, int(y1 / H_img * gH))
     r1 = min(gH, int(y2 / H_img * gH) + 1)
     c0 = max(0, int(x1 / W_img * gW))
@@ -89,8 +88,7 @@ def bbox_to_patch_mask(
         from torchvision.transforms.functional import gaussian_blur
         k = max(3, int(blur_sigma * 3) * 2 + 1)
         mask = gaussian_blur(mask.unsqueeze(0).unsqueeze(0), kernel_size=k, sigma=blur_sigma)
-        mask = mask.squeeze(0).squeeze(0)
-        mask = mask.clamp(0, 1)
+        mask = mask.squeeze(0).squeeze(0).clamp(0, 1)
 
     return mask.flatten()
 
@@ -102,15 +100,11 @@ def soft_patch_mask(
     normalized: bool = False,
     temperature: float = 1.0,
 ) -> torch.Tensor:
-    """
-    Normalize the patch mask into a probability distribution.
-    temperature < 1.0 → sharper; temperature > 1.0 → softer.
-    """
+    """Normalize the patch mask into a probability distribution."""
     mask = bbox_to_patch_mask(bbox, image_hw, patch_grid_hw, normalized)
     if mask.sum() == 0:
         return torch.ones_like(mask) / mask.numel()
     normalized_mask = mask / (mask.sum() + 1e-8)
-    # Apply temperature scaling via log-space
     log_mask = torch.log(normalized_mask + 1e-8) / temperature
     return torch.softmax(log_mask, dim=0)
 
@@ -123,7 +117,7 @@ def grid_thw_to_hw(grid_thw: torch.Tensor) -> Tuple[int, int]:
     """
     Extract (H, W) from Qwen2.5-VL grid_thw tensor.
     grid_thw shape: [1, 3] or [3] with values (T, H, W).
-    H and W here are in units of merge_size patches.
+    These are the PRE-merger ViT patch grid dimensions.
     """
     if grid_thw.dim() == 2:
         t, h, w = grid_thw[0].tolist()
@@ -134,12 +128,17 @@ def grid_thw_to_hw(grid_thw: torch.Tensor) -> Tuple[int, int]:
 
 def compute_patch_grid_hw(grid_thw: torch.Tensor, merge_size: int = 2) -> Tuple[int, int]:
     """
-    Compute the final patch grid (H, W) AFTER the visual merger's merge_size.
-    In Qwen2.5-VL, the visual merger reduces spatial resolution by merge_size.
-    grid_thw stores the pre-merger grid in units of (merge_size × patch_size).
+    Compute the post-merger patch grid (H_actual, W_actual).
+
+    Qwen2.5-VL's Vision MLP Merger fuses merge_size×merge_size ViT tokens into
+    one LLM token. grid_thw stores the PRE-merger ViT grid dimensions (T, H, W).
+    After the merger the spatial grid shrinks by a factor of merge_size in each
+    dimension, so the actual token count is:
+
+        N_tokens = T * (H // merge_size) * (W // merge_size)
+
+    This must match visual_memory.shape[-2] (output of encode_image_to_memory).
+    Read merge_size from model.config.vision_config.spatial_merge_size (default 2).
     """
     h, w = grid_thw_to_hw(grid_thw)
-    # After merger: spatial dims stay the same in terms of visual tokens
-    # (merger fuses merge_size×merge_size patches into one token)
-    # So the NUMBER of visual tokens = T * H * W (from grid_thw)
-    return h, w
+    return h // merge_size, w // merge_size

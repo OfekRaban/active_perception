@@ -12,16 +12,26 @@ Architecture:
        │
        z_raw  [B, K, D_llm]
        │
-  OutputProjection + LayerNorm          (optional residual)
+  OutputProjection + LayerNorm
+       │
+       z_visual  [B, K, D_llm]          (pure visual retrieval output)
+       │
+  Learned Scalar Gate                   (gate = sigmoid(W_g @ h_perception))
+       │
+  z_perception = h_perception + gate * z_visual   (gated residual)
        │
   z_perception  [B, K, D_llm]          (injected at <PERC_OUT> positions)
 
 Design choices:
-- NO hard spatial sparsity (no top-k masking). The bottleneck is at the OUTPUT
-  level (single z token), not at the attention level. Soft attention allows
-  distributed, multi-focal, and global evidence compression.
+- NO hard spatial sparsity. The bottleneck is at the OUTPUT level (single z token),
+  not at the attention level. Soft attention allows distributed, multi-focal, and
+  global evidence compression.
 - attn_weights are returned for diagnostics and optional grounding loss.
-- Residual connection from h_perception is optional (helps early training).
+- Gated residual (Issue 5 fix): replaces the hard residual `z = z + h` with a
+  learned scalar gate that controls how much visual evidence supplements the text
+  prior. At init (gate_proj weights=0, bias=0), gate ≈ 0.5. During training the
+  model can specialize toward pure visual retrieval (gate→1) or pure text bypass
+  (gate→0), keeping the injected embedding on a consistent manifold.
 """
 from __future__ import annotations
 import logging
@@ -69,14 +79,15 @@ class QueryAdapter(nn.Module):
 
 class PerceptionModule(nn.Module):
     """
-    Full perception module: QueryAdapter + CrossAttention + OutputProjection.
+    Full perception module: QueryAdapter + CrossAttention + OutputProjection + GatedResidual.
 
     Args:
         d_model:    LLM hidden dimension (e.g., 3584 for Qwen2.5-7B)
         d_query:    Bottleneck dimension in QueryAdapter (default: 256)
         num_heads:  Number of attention heads for cross-attention
         dropout:    Dropout probability
-        residual:   If True, add h_perception residual to z_perception output
+        residual:   If True, use a learned scalar gate residual from h_perception.
+                    If False, output is pure visual retrieval (z_visual only).
     """
 
     def __init__(
@@ -93,8 +104,6 @@ class PerceptionModule(nn.Module):
 
         self.query_adapter = QueryAdapter(d_model, d_query, dropout)
 
-        # PyTorch MultiheadAttention: Q,K,V all in d_model space
-        # (query_adapter already maps to d_model)
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
@@ -105,17 +114,25 @@ class PerceptionModule(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=True)
         self.layer_norm = nn.LayerNorm(d_model)
 
+        if residual:
+            # Scalar gate: g = sigmoid(W_g h + b_g), init to 0.5 (b_g=0, W_g=0).
+            # Controls how much z_visual supplements h_perception.
+            # Logging gate.mean() over training reveals whether the module is
+            # converging toward visual retrieval (→1) or text bypass (→0).
+            self.gate_proj = nn.Linear(d_model, 1, bias=True)
+            nn.init.zeros_(self.gate_proj.weight)
+            nn.init.zeros_(self.gate_proj.bias)  # sigmoid(0) = 0.5 at init
+
         self._init_output_proj()
 
         num_params = sum(p.numel() for p in self.parameters())
         logger.info(
             f"[PerceptionModule] d_model={d_model}, d_query={d_query}, "
-            f"num_heads={num_heads}, residual={residual}, "
+            f"num_heads={num_heads}, residual={residual} (gated), "
             f"params={num_params/1e6:.2f}M"
         )
 
     def _init_output_proj(self):
-        # Small initialization for output projection to prevent large perturbations early on
         nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
         nn.init.zeros_(self.out_proj.bias)
 
@@ -139,20 +156,17 @@ class PerceptionModule(nn.Module):
             z_perception:  [B, K, D] — latent visual evidence tokens
             attn_weights:  [B, K, N] — averaged over heads (or None)
         """
-        # Handle unbatched case (K queries, no batch dim)
         unbatched = h_perception.dim() == 2
         if unbatched:
             h_perception = h_perception.unsqueeze(0)
             visual_memory = visual_memory.unsqueeze(0)
 
         B, K, D = h_perception.shape
-        N = visual_memory.shape[1]
 
         # 1. Query adapter: compress h_perception into structured query
         q = self.query_adapter(h_perception)  # [B, K, D]
 
         # 2. Cross-attention over visual memory
-        # If B > 1 but visual_memory is [1, N, D] (shared image), expand
         if visual_memory.shape[0] == 1 and B > 1:
             visual_memory = visual_memory.expand(B, -1, -1)
 
@@ -162,17 +176,24 @@ class PerceptionModule(nn.Module):
             value=visual_memory,
             key_padding_mask=key_padding_mask,
             need_weights=return_attn_weights,
-            average_attn_weights=True,  # [B, K, N] averaged over heads
+            average_attn_weights=True,
         )
         # z_raw: [B, K, D]
 
-        # 3. Output projection + LayerNorm
-        z = self.out_proj(z_raw)
-        z = self.layer_norm(z)
+        # 3. Output projection + LayerNorm → pure visual retrieval signal
+        z_visual = self.out_proj(z_raw)
+        z_visual = self.layer_norm(z_visual)  # [B, K, D]
 
-        # 4. Optional residual from h_perception
+        # 4. Gated residual from h_perception (Issue 5 fix).
+        #    z = h + sigmoid(W_g @ h) * z_visual
+        #    At init: gate ≈ 0.5 → z ≈ h + 0.5 * z_visual (stable, in-manifold).
+        #    The gate decouples the visual retrieval space from the text space:
+        #    z_visual is the visual evidence; h is the text prior; gate is learned.
         if self.residual:
-            z = z + h_perception
+            gate = torch.sigmoid(self.gate_proj(h_perception))  # [B, K, 1]
+            z = h_perception + gate * z_visual
+        else:
+            z = z_visual
 
         if unbatched:
             z = z.squeeze(0)

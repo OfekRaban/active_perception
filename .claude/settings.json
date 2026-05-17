@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//cortex/users/rabanof/**)",
+      "Read(//cortex/**)",
+      "Bash(ls /models/)",
+      "Read(//data/**)",
+      "Bash(find /cortex -maxdepth 4 -type d -name \"Qwen*\" 2>/dev/null | head -10; find /data -maxdepth 4 -type d -name \"Qwen*\" 2>/dev/null | head -10; find /home -maxdepth 5 -type d -name \"Qwen*\" 2>/dev/null | head -5)",
+      "Read(//home/**)",
+      "Bash(/cortex/users/rabanof/conda_envs/qwen49/bin/python -m pytest /cortex/users/rabanof/projects/active_perception/tests/test_perception_module.py -v)",
+      "Bash(/cortex/users/rabanof/conda_envs/qwen49/bin/pip install *)",
+      "Bash(/cortex/users/rabanof/conda_envs/qwen49/bin/python -m pytest tests/test_perception_module.py -v)"
+    ]
+  }
+}
