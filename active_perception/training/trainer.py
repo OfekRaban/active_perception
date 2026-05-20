@@ -289,19 +289,81 @@ class ActivePerceptionTrainer:
                 debug=debug,
             )
 
-        # Compute auxiliary losses
-        # For semantic alignment: would need obs text embeddings (pre-computed)
-        # For now: pass None → auxiliary losses gracefully skip
+        # Build patch_masks from bboxes when grounding loss is active.
+        # The collator provides batch["bboxes"] but not tensored patch_masks;
+        # we compute them here so grounding works without dataset changes.
+        patch_masks = batch.get("patch_masks")
+        if self.lcfg.use_grounding and patch_masks is None and batch.get("bboxes") is not None:
+            patch_masks = self._build_patch_masks(
+                batch["bboxes"],
+                batch.get("image_grid_thw"),
+                out["attn_weights_list"],
+            )
+
         loss_out = self.loss_fn.compute(
             loss_ce=out["loss_ce"],
             z_perceptions=out["z_perceptions"],
             attn_weights_list=out["attn_weights_list"],
             obs_text_embeddings=batch.get("obs_text_embeddings"),
             crop_embeddings=batch.get("crop_embeddings"),
-            patch_masks=batch.get("patch_masks"),
+            patch_masks=patch_masks,
         )
 
         return loss_out
+
+    def _build_patch_masks(
+        self,
+        bboxes_batch: List,
+        grid_thw: Optional[torch.Tensor],
+        attn_weights_list: List,
+    ) -> List[Optional[torch.Tensor]]:
+        """
+        Build [K, N] patch mask tensors from normalized bboxes.
+
+        K is capped to match the number of attention weight vectors so the
+        grounding loss min(K_attn, K_mask) truncation has no effect.
+        Returns None for batch items with no valid bboxes.
+        """
+        merge_size = getattr(
+            self.model.base_model.config.vision_config, "spatial_merge_size", 2
+        )
+        patch_masks = []
+        for b_idx, bboxes in enumerate(bboxes_batch):
+            attn_b = attn_weights_list[b_idx] if b_idx < len(attn_weights_list) else None
+            if not bboxes or attn_b is None or grid_thw is None:
+                patch_masks.append(None)
+                continue
+
+            try:
+                _, H_pre, W_pre = [int(x) for x in grid_thw[b_idx].cpu().tolist()]
+            except (IndexError, AttributeError):
+                patch_masks.append(None)
+                continue
+
+            H, W = H_pre // merge_size, W_pre // merge_size
+            N = H * W
+            K_attn = attn_b.shape[0]
+            K = min(len(bboxes), K_attn)
+
+            masks = torch.zeros(K, N, dtype=torch.float32, device=self.device)
+            cy = (torch.arange(H, device=self.device, dtype=torch.float32) + 0.5) / H
+            cx = (torch.arange(W, device=self.device, dtype=torch.float32) + 0.5) / W
+            for k in range(K):
+                bbox = bboxes[k]
+                if bbox is None or len(bbox) != 4:
+                    continue
+                x1, y1, x2, y2 = bbox
+                row_mask = (cy >= y1) & (cy <= y2)
+                col_mask = (cx >= x1) & (cx <= x2)
+                grid_mask = row_mask.unsqueeze(1) & col_mask.unsqueeze(0)
+                masks[k] = grid_mask.flatten().float()
+
+            if masks.sum() == 0:
+                patch_masks.append(None)
+            else:
+                patch_masks.append(masks)
+
+        return patch_masks
 
     # =========================================================================
     # Evaluation

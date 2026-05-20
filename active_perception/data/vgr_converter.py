@@ -1,27 +1,28 @@
 """
 VGR → ActivePerception format converter.
 
-VGR dataset format (assistant side):
+Actual VGR dataset format (assistant side):
     <think>
-    ...reasoning...<sot>[x1,y1,x2,y2]<eot>
-    observation / visual replay text
-    ...continued reasoning...
+    ...reasoning...<SOT>[x1, y1, x2, y2]<EOT><image>...more reasoning...
     </think>
     final answer
 
+    Coordinates are normalized to [0, 1].
+    The <image> token always immediately follows <EOT>.
+    There is NO observation/replay text after the bbox token.
+
 Converted format:
     <think>
-    ...reasoning...<PERCEPTION> <PERC_OUT>
-    observation / visual replay text
-    ...continued reasoning...
+    ...reasoning...<PERCEPTION> <PERC_OUT>...more reasoning...
     </think>
     final answer
 
 Key design decisions:
-- BBox coordinates are stored as supervision metadata ONLY (never in model text).
-- Observation text is PRESERVED after <PERC_OUT>. The CE loss on this text
-  is the primary gradient signal into z_perception / cross-attention / Query Adapter.
-- Multi-step support: multiple <sot>...<eot> → multiple <PERCEPTION> <PERC_OUT> pairs.
+- BBox coordinates stored as supervision metadata ONLY (never in model text).
+- VGR has no observation text — observation_text=None, target_type="none".
+- bbox_normalized=True for all VGR steps (coords in [0, 1]).
+- The trailing <image> token is consumed as part of the bbox pattern.
+- Multi-bbox samples handled transparently via finditer.
 """
 from __future__ import annotations
 import re
@@ -34,23 +35,20 @@ from .schema import ActivePerceptionSample, PerceptionStep
 
 logger = logging.getLogger(__name__)
 
-# VGR bbox token pattern: <sot>[x1,y1,x2,y2]<eot> or <sot>x1,y1,x2,y2<eot>
+# VGR actual bbox pattern: <SOT>[x1, y1, x2, y2]<EOT><image>
+# Coords are normalized floats in [0, 1]. The <image> token is always present.
 _BBOX_RE = re.compile(
-    r'<sot>\[?'
-    r'([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)'
-    r'\]?<eot>'
+    r'<SOT>\[([^\]]+)\]<EOT><image>',
+    re.IGNORECASE,
 )
 
-# Observation text: text immediately after <eot> up to the next paragraph break
-# or next <sot> or </think>. We capture it greedily but stop at natural boundaries.
-# This pattern captures the "visual replay" paragraph that VGR inserts after each bbox.
-_OBS_TEXT_RE = re.compile(
-    r'<sot>\[?[\d.,\s]+\]?<eot>'   # the bbox token (already consumed)
-    r'\s*'
-    r'(.*?)'                         # observation text (lazy)
-    r'(?=\n\s*\n|\n<sot>|</think>|$)',  # stop at blank line, next bbox, or end of think
-    re.DOTALL
-)
+
+def _parse_coords(coord_str: str) -> List[float]:
+    """'0.49, 0.57, 0.67, 1.0' → [0.49, 0.57, 0.67, 1.0]"""
+    parts = [x.strip() for x in coord_str.split(',')]
+    if len(parts) != 4:
+        raise ValueError(f"Expected 4 coords, got {len(parts)}: {coord_str!r}")
+    return [float(x) for x in parts]
 
 
 class VGRConverter:
@@ -68,13 +66,9 @@ class VGRConverter:
     def __init__(
         self,
         image_root: Optional[str] = None,
-        keep_original_obs_text: bool = True,
-        min_obs_text_len: int = 5,
         verbose: bool = False,
     ):
         self.image_root = Path(image_root) if image_root else None
-        self.keep_original_obs_text = keep_original_obs_text
-        self.min_obs_text_len = min_obs_text_len
         self.verbose = verbose
         self._stats: Dict[str, int] = {
             "total": 0, "converted": 0, "skipped": 0,
@@ -139,20 +133,14 @@ class VGRConverter:
         if human_turn.get("from") != "human" or gpt_turn.get("from") != "gpt":
             return None
 
-        # Extract question (strip <image> tag)
         question = human_turn.get("value", "").replace("<image>", "").strip()
         raw_response = gpt_turn.get("value", "")
 
         if not raw_response:
             return None
 
-        # Parse the response: convert bboxes → <PERCEPTION> <PERC_OUT>
         converted_response, steps = self._parse_and_convert_response(raw_response)
-
-        # Extract answer (text after </think>)
         answer = self._extract_answer(raw_response)
-
-        # Resolve image path
         image_path = self._resolve_image(raw.get("image", ""))
 
         sample = ActivePerceptionSample(
@@ -179,121 +167,44 @@ class VGRConverter:
         self, response: str
     ) -> Tuple[str, List[PerceptionStep]]:
         """
-        Find all bbox tokens in the response, extract observation text,
-        replace with <PERCEPTION> <PERC_OUT>, and return converted response + steps.
+        Replace all <SOT>[x1, y1, x2, y2]<EOT><image> occurrences with
+        <PERCEPTION> <PERC_OUT> and collect bbox metadata as PerceptionSteps.
         """
         steps: List[PerceptionStep] = []
-        result = response
-
-        # We process matches from left to right, building the converted string.
-        # We need to track offset shifts as we replace substrings.
-
-        # First pass: find all bboxes and their positions + observation texts
-        events = self._find_bbox_events(response)
-
-        if not events:
-            return response, []
-
-        # Second pass: rebuild the string with replacements
-        converted_parts = []
+        parts: List[str] = []
         cursor = 0
 
-        for i, (match_start, match_end, bbox, obs_text) in enumerate(events):
-            # Text before this bbox
-            converted_parts.append(response[cursor:match_start])
+        for i, m in enumerate(_BBOX_RE.finditer(response)):
+            try:
+                bbox = _parse_coords(m.group(1))
+            except ValueError as e:
+                logger.warning(f"[VGRConverter] Skipping malformed bbox: {e}")
+                continue
 
-            # Replacement: <PERCEPTION> <PERC_OUT>
-            replacement = f"{self.PERCEPTION_TOKEN} {self.PERC_OUT_TOKEN}"
-            if obs_text and self.keep_original_obs_text:
-                # Preserve observation text AFTER <PERC_OUT>
-                replacement = replacement + "\n" + obs_text
+            parts.append(response[cursor:m.start()])
+            parts.append(f"{self.PERCEPTION_TOKEN} {self.PERC_OUT_TOKEN}")
+            cursor = m.end()
 
-            converted_parts.append(replacement)
-            cursor = match_end + (len(obs_text) if obs_text else 0)
-
-            step = PerceptionStep(
+            steps.append(PerceptionStep(
                 index=i,
                 bbox=bbox,
-                bbox_normalized=False,  # VGR uses pixel coords by default
-                observation_text=obs_text if obs_text else None,
-                target_type="observation_text" if obs_text else "none",
-            )
-            steps.append(step)
+                bbox_normalized=True,
+                observation_text=None,
+                target_type="none",
+            ))
 
-        # Remaining text
-        converted_parts.append(response[cursor:])
-        converted = "".join(converted_parts)
-
-        return converted, steps
-
-    def _find_bbox_events(
-        self, text: str
-    ) -> List[Tuple[int, int, List[float], Optional[str]]]:
-        """
-        Find all <sot>bbox<eot> occurrences and extract trailing observation text.
-
-        Returns list of (match_start, match_end, bbox_list, observation_text).
-        match_end points to end of <eot> token (NOT including obs_text).
-        """
-        events = []
-        for m in _BBOX_RE.finditer(text):
-            bbox = [float(m.group(i)) for i in range(1, 5)]
-            bbox_end = m.end()
-
-            # Extract observation text: text after <eot> up to paragraph break / next bbox / </think>
-            obs_text = self._extract_obs_text(text, bbox_end)
-
-            events.append((m.start(), bbox_end, bbox, obs_text))
-
-        return events
-
-    def _extract_obs_text(self, text: str, start: int) -> Optional[str]:
-        """Extract observation/replay text starting at `start` in `text`."""
-        tail = text[start:]
-
-        # Skip leading whitespace / newlines
-        stripped_start = len(tail) - len(tail.lstrip())
-        tail = tail.lstrip()
-
-        if not tail:
-            return None
-
-        # Find where observation text ends:
-        # - blank line (paragraph break)
-        # - next <sot>
-        # - </think>
-        # We take text up to the first of these
-        end_patterns = [
-            re.search(r'\n\s*\n', tail),        # blank line
-            re.search(r'<sot>', tail),           # next bbox
-            re.search(r'</think>', tail),        # end of think block
-        ]
-        end_positions = [m.start() for m in end_patterns if m is not None]
-
-        if end_positions:
-            obs_end = min(end_positions)
-        else:
-            obs_end = len(tail)
-
-        obs_text = tail[:obs_end].strip()
-
-        if len(obs_text) < self.min_obs_text_len:
-            return None
-
-        return obs_text
+        parts.append(response[cursor:])
+        return "".join(parts), steps
 
     def _extract_answer(self, response: str) -> str:
-        """Extract the final answer text (after </think>)."""
+        """Text after </think>, or the full response if no think block."""
         think_end = response.rfind("</think>")
         if think_end == -1:
-            # No think block; treat entire response as answer
             return response.strip()
         return response[think_end + len("</think>"):].strip()
 
     def _resolve_image(self, image_val: Any) -> str:
-        """Resolve image path. image_val may be a string path or bytes."""
         if isinstance(image_val, bytes):
-            # Raw bytes - caller must handle storage; return placeholder
             return "__bytes__"
         path = str(image_val)
         if self.image_root and not Path(path).is_absolute():

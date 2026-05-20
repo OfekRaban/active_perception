@@ -39,10 +39,20 @@ from active_perception.training.trainer import ActivePerceptionTrainer, TrainerC
 from torch.utils.data import DataLoader
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base. Override wins on scalar conflicts."""
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
 def load_config(config_path: str) -> dict:
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
-    # Handle defaults inheritance (simple flat merge)
     if "defaults" in cfg:
         base_names = cfg.pop("defaults")
         for base_name in base_names:
@@ -50,8 +60,7 @@ def load_config(config_path: str) -> dict:
             if base_path.exists():
                 with open(base_path) as fb:
                     base_cfg = yaml.safe_load(fb)
-                base_cfg.update(cfg)
-                cfg = base_cfg
+                cfg = _deep_merge(base_cfg, cfg)
     return cfg
 
 
@@ -87,6 +96,9 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--init_checkpoint", default=None,
+                        help="Load PerceptionModule weights from this checkpoint dir before training "
+                             "(resets optimizer; use for warm-start or continued training).")
     args, unknown = parser.parse_known_args()
 
     # Load YAML config
@@ -102,6 +114,10 @@ def main():
     logger.info(f"Model config: {model_cfg}")
     model = ActivePerceptionModel(model_cfg)
     model = model.to(device)
+
+    if args.init_checkpoint:
+        logger.info(f"Loading perception module from init checkpoint: {args.init_checkpoint}")
+        model.load_perception_module(args.init_checkpoint)
 
     if cfg.get("training", {}).get("gradient_checkpointing", True):
         model.base_model.gradient_checkpointing_enable()

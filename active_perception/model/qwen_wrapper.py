@@ -19,13 +19,24 @@ M-RoPE notes:
   lives only in the external visual_memory, accessed via the perception cross-attn.
 
 Special token embeddings (Issue 4 fix):
-  The 3 new tokens (<IMAGE>, <PERCEPTION>, <PERC_OUT>) are registered as a
-  separate nn.Parameter `special_token_embeddings` [3, d_model] instead of
-  unfreezing the full 152k-row embedding table. Adam only tracks optimizer
-  states for these 3 rows (~10k params) rather than all 545M embedding params.
-  The embedding table stays fully frozen. The _embed() helper injects the
-  learnable rows at forward time by overwriting positions where input_ids
-  equals one of the 3 special token IDs.
+  The 4 new tokens (<IMAGE>, <PERCEPTION>, <PERC_OUT>, <INIT_PERC_OUT>) are
+  registered as a separate nn.Parameter `special_token_embeddings` [4, d_model]
+  instead of unfreezing the full 152k-row embedding table. Adam only tracks
+  optimizer states for these 4 rows (~14k params) rather than all 545M embedding
+  params. The embedding table stays fully frozen. The _embed() helper injects
+  the learnable rows at forward time by overwriting positions where input_ids
+  equals one of the 4 special token IDs.
+
+Initial perception modes (initial_perception_mode):
+  Before CoT begins, the model can receive a pre-injected visual context at
+  <INIT_PERC_OUT>. Three ablation configurations:
+    "latent"  — PerceptionModule is queried using the <IMAGE> hidden state
+                from Pass 1 → z_init is injected at <INIT_PERC_OUT> in Pass 2.
+    "spatial" — visual_memory is adaptively avg-pooled to spatial_pool_size²
+                tokens; <INIT_PERC_OUT> is expanded to that many positions in
+                the sequence, each receiving one pooled visual patch.
+    "none"    — <INIT_PERC_OUT> is removed from the sequence entirely; blind
+                CoT baseline with no pre-injected visual context.
 
 Pass 1 no_grad (Issue 3 fix):
   Pass 1 (h_perception extraction) always runs under torch.no_grad(),
@@ -56,10 +67,10 @@ logger = logging.getLogger(__name__)
 class ActivePerceptionConfig:
     # ── Model paths ──────────────────────────────────────────────────────────
     model_path: str = "/path/to/Qwen2.5-VL-7B-Instruct"
+    attn_implementation: str = "sdpa"      # "eager" | "sdpa" | "flash_attention_2"
     # ── Architecture ─────────────────────────────────────────────────────────
     d_query: int = 256
     num_perception_heads: int = 8
-    perception_residual: bool = True
     spatial_encoding_mode: str = "none"
     # ── Special token initialization ─────────────────────────────────────────
     token_init_strategy: str = "mean_visual_text"
@@ -75,6 +86,9 @@ class ActivePerceptionConfig:
     freeze_vit: bool = True
     freeze_projector: bool = True
     freeze_llm: bool = True
+    # ── Initial perception ablation ───────────────────────────────────────────
+    initial_perception_mode: str = "latent"  # "latent" | "spatial" | "none"
+    spatial_pool_size: int = 4               # NxN for spatial mode (4 → 16 tokens)
     # ── Training ─────────────────────────────────────────────────────────────
     perception_dropout: float = 0.0
     # ── Dtype ────────────────────────────────────────────────────────────────
@@ -105,17 +119,18 @@ class ActivePerceptionModel(nn.Module):
 
         # ── Learnable special token embeddings (Issue 4 fix) ─────────────────
         # Extract initialized values from the embedding table, then freeze the
-        # table. Only these 3 rows are trainable, via an external Parameter.
-        # Adam stores optimizer states for ~10k params instead of ~545M.
+        # table. Only these 4 rows are trainable, via an external Parameter.
+        # Adam stores optimizer states for ~14k params instead of ~545M.
         embed = self.base_model.get_input_embeddings()
         new_ids = [
             self.special_tokens.IMAGE,
             self.special_tokens.PERCEPTION,
             self.special_tokens.PERC_OUT,
+            self.special_tokens.INIT_PERC_OUT,
         ]
         with torch.no_grad():
             init_embeds = embed.weight.data[new_ids].clone().float()  # float32 for optimizer stability
-        self.special_token_embeddings = nn.Parameter(init_embeds)  # [3, d_model]
+        self.special_token_embeddings = nn.Parameter(init_embeds)  # [4, d_model]
 
         # ── Cache important token IDs ─────────────────────────────────────────
         self.image_pad_id = self._find_image_pad_id()
@@ -129,8 +144,7 @@ class ActivePerceptionModel(nn.Module):
             d_query=config.d_query,
             num_heads=config.num_perception_heads,
             dropout=config.perception_dropout,
-            residual=config.perception_residual,
-        )
+        ).to(self.dtype)  # match LLM dtype so hidden states flow in without casting
 
         # ── Spatial encoding (Issue 2 fix: pass merge_size from model config) ─
         merge_size = getattr(
@@ -167,6 +181,7 @@ class ActivePerceptionModel(nn.Module):
             model_path,
             torch_dtype=self.dtype,
             device_map=None,
+            attn_implementation=self.config.attn_implementation,
             local_files_only=True,
         )
         processor = AutoProcessor.from_pretrained(
@@ -253,6 +268,7 @@ class ActivePerceptionModel(nn.Module):
             self.special_tokens.IMAGE,
             self.special_tokens.PERCEPTION,
             self.special_tokens.PERC_OUT,
+            self.special_tokens.INIT_PERC_OUT,
         ]
         # Fast path: skip clone if no special tokens present
         if not any((input_ids == tid).any() for tid in tids):
@@ -404,67 +420,97 @@ class ActivePerceptionModel(nn.Module):
         perc_positions: List[List[int]],
         perc_out_positions: List[List[int]],
         debug: bool = False,
+        **_,  # absorb extra batch metadata (bboxes, sample_ids, sources, etc.)
     ) -> Dict[str, torch.Tensor]:
         """
-        Full two-pass training step.
+        Full two-pass training step with initial_perception_mode dispatch.
 
-        Pass 1 (Issue 3 fix — always no_grad):
-          Run LLM to extract h_perception at <PERCEPTION> positions.
-          Treating this as stop-gradient avoids holding two full 7B computation
-          graphs simultaneously. LoRA gradients still reach the LLM weights
-          via Pass 2, so the truncation has negligible empirical impact.
+        initial_perception_mode:
+          "latent"  — <INIT_PERC_OUT> embedding replaced by z_init, computed via
+                      PerceptionModule queried from the <IMAGE> hidden state (Pass 1).
+          "spatial" — <INIT_PERC_OUT> expanded to spatial_pool_size² positions;
+                      each receives one adaptively pooled visual patch. Pass 1 sees
+                      the spatial context so h_perception benefits from it.
+          "none"    — <INIT_PERC_OUT> removed entirely; blind CoT baseline.
 
-        Pass 2 (with grad):
-          Inject z_perception at <PERC_OUT> positions; run full LLM forward
-          for CE loss. Gradients flow: CE → LLM (Pass 2) → z_perception →
-          PerceptionModule → QueryAdapter → (stop at h_perception).
-
-        Returns dict with:
-          loss_ce, logits, z_perceptions, attn_weights_list,
-          modified_input_ids, modified_labels
+        Pass 1 (always no_grad): run LLM → extract h at <IMAGE> and <PERCEPTION>.
+        Pass 2 (with grad): inject all visual tokens; compute CE loss.
         """
+        mode = self.config.initial_perception_mode
+        init_perc_out_id = self.special_tokens.INIT_PERC_OUT
+
         # ── Step 1: Encode image → visual memory ─────────────────────────────
         visual_memory = self.encode_image_to_memory(pixel_values, image_grid_thw)
-        # visual_memory: [N_actual, D]
 
-        # ── Step 2: Sequence surgery ──────────────────────────────────────────
+        # ── Step 2: Sequence surgery (image_pad block → <IMAGE>) ─────────────
         mod_ids, mod_mask, mod_labels, position_ids = self.build_modified_sequence(
             input_ids, attention_mask, labels, debug=debug
         )
 
+        # ── Step 3: Mode-specific structural changes to the sequence ──────────
+        spatial_tokens: Optional[torch.Tensor] = None
+        if mode == "none":
+            mod_ids, mod_mask, mod_labels, position_ids = self._remove_token_from_sequences(
+                init_perc_out_id, mod_ids, mod_mask, mod_labels, position_ids
+            )
+        elif mode == "spatial":
+            spatial_tokens = self._pool_visual_memory(visual_memory, image_grid_thw)
+            n_spatial = self.config.spatial_pool_size ** 2
+            mod_ids, mod_mask, mod_labels, position_ids = self._splice_spatial_tokens(
+                init_perc_out_id, n_spatial, mod_ids, mod_mask, mod_labels, position_ids
+            )
+
         B, T_new = mod_ids.shape
         device = mod_ids.device
 
-        # ── Step 3: Build Pass 1 embeddings ──────────────────────────────────
-        base_embeds = self._embed(mod_ids)           # [B, T_new, D]
-        # Zero <PERC_OUT> embeddings so they don't influence h_perception
-        # (causal attn: <PERC_OUT> comes after <PERCEPTION>, but zero is safer)
-        perc_out_id = self.special_tokens.PERC_OUT
-        perc_out_mask_2d = (mod_ids == perc_out_id)
-        base_embeds = base_embeds.clone()
-        base_embeds[perc_out_mask_2d] = 0.0
+        # ── Step 4: Build Pass 1 embeddings ──────────────────────────────────
+        base_embeds = self._embed(mod_ids).clone().to(self.dtype)
 
-        # ── Pass 1: Extract h_perception (Issue 3 fix: always no_grad) ───────
+        # Zero <PERC_OUT> in Pass 1 (causal: comes after <PERCEPTION>, but safer)
+        base_embeds[mod_ids == self.special_tokens.PERC_OUT] = 0.0
+
+        if mode == "latent":
+            # z_init not yet computed — zero the placeholder
+            base_embeds[mod_ids == init_perc_out_id] = 0.0
+        elif mode == "spatial" and spatial_tokens is not None:
+            # Inject spatial tokens into Pass 1 so h_perception sees visual context
+            pooled_p1 = spatial_tokens.to(dtype=base_embeds.dtype, device=device)
+            for b in range(B):
+                init_pos = (mod_ids[b] == init_perc_out_id).nonzero(as_tuple=True)[0]
+                if len(init_pos) > 0:
+                    base_embeds[b, init_pos, :] = pooled_p1
+
+        # ── Pass 1: Extract hidden states (always no_grad) ────────────────────
         with torch.no_grad():
-            pass1_out = self.base_model.model(
+            pass1_out = self._get_inner_transformer()(
                 inputs_embeds=base_embeds,
                 attention_mask=mod_mask,
-                position_ids=position_ids,
                 output_hidden_states=False,
                 use_cache=False,
             )
         hs_pass1 = pass1_out.last_hidden_state  # [B, T_new, D]
 
-        # ── Run PerceptionModule per batch item ───────────────────────────────
-        z_perceptions = []
-        attn_weights_list = []
-
+        # ── Step 5: Visual memory for cross-attention ─────────────────────────
         vm = visual_memory.unsqueeze(0)  # [1, N_actual, D]
         if self.config.spatial_encoding_mode != "none":
             vm = self.spatial_encoding(vm, image_grid_thw)
 
+        # ── Step 6: Compute z_init for "latent" mode ─────────────────────────
+        z_init_by_batch: Dict[int, torch.Tensor] = {}
+        if mode == "latent":
+            for b in range(B):
+                img_pos = (mod_ids[b] == self.special_tokens.IMAGE).nonzero(as_tuple=True)[0]
+                if len(img_pos) == 0:
+                    continue
+                h_img = hs_pass1[b, img_pos[0].item():img_pos[0].item() + 1, :].unsqueeze(0)
+                z_init, _ = self.perception_module(h_img, vm, return_attn_weights=False)
+                z_init_by_batch[b] = z_init.squeeze(0).squeeze(0)  # [D]
+
+        # ── Step 7: PerceptionModule for mid-CoT <PERCEPTION> tokens ─────────
+        z_perceptions: List[Optional[torch.Tensor]] = []
+        attn_weights_list: List[Optional[torch.Tensor]] = []
+
         for b in range(B):
-            # Re-detect PERCEPTION positions in the modified (surgery-adjusted) sequence
             b_perc_pos = (mod_ids[b] == self.special_tokens.PERCEPTION).nonzero(
                 as_tuple=True
             )[0].tolist()
@@ -474,23 +520,26 @@ class ActivePerceptionModel(nn.Module):
                 attn_weights_list.append(None)
                 continue
 
-            K = len(b_perc_pos)
-            h_p = hs_pass1[b, b_perc_pos, :]   # [K, D] — stop-gradient input
-            h_p_batched = h_p.unsqueeze(0)       # [1, K, D]
+            h_p = hs_pass1[b, b_perc_pos, :].unsqueeze(0)  # [1, K, D]
+            z, attn_w = self.perception_module(h_p, vm, return_attn_weights=True)
+            z_perceptions.append(z.squeeze(0))
+            attn_weights_list.append(attn_w.squeeze(0) if attn_w is not None else None)
 
-            z, attn_w = self.perception_module(
-                h_perception=h_p_batched,
-                visual_memory=vm,
-                return_attn_weights=True,
-            )
-            z = z.squeeze(0)        # [K, D]
-            attn_w = attn_w.squeeze(0) if attn_w is not None else None
-
-            z_perceptions.append(z)
-            attn_weights_list.append(attn_w)
-
-        # ── Pass 2: Inject z_perception at <PERC_OUT>, full forward ──────────
+        # ── Pass 2: Inject all visual tokens; full forward for CE ────────────
         embeds_pass2 = self._embed(mod_ids).to(self.dtype)
+
+        if mode == "latent":
+            for b, z_init in z_init_by_batch.items():
+                init_pos = (mod_ids[b] == init_perc_out_id).nonzero(as_tuple=True)[0]
+                if len(init_pos) > 0:
+                    embeds_pass2[b, init_pos[0].item(), :] = z_init.to(self.dtype)
+
+        elif mode == "spatial" and spatial_tokens is not None:
+            pooled_p2 = spatial_tokens.to(self.dtype)
+            for b in range(B):
+                init_pos = (mod_ids[b] == init_perc_out_id).nonzero(as_tuple=True)[0].tolist()
+                for k, pos in enumerate(init_pos):
+                    embeds_pass2[b, pos, :] = pooled_p2[k]
 
         for b in range(B):
             if z_perceptions[b] is None:
@@ -510,7 +559,6 @@ class ActivePerceptionModel(nn.Module):
         pass2_out = self.base_model(
             inputs_embeds=embeds_pass2,
             attention_mask=mod_mask,
-            position_ids=position_ids,
             labels=mod_labels,
             output_hidden_states=False,
             use_cache=False,
@@ -551,6 +599,8 @@ class ActivePerceptionModel(nn.Module):
           4. Continue generation.
         """
         device = input_ids.device
+        mode = self.config.initial_perception_mode
+        init_perc_out_id = self.special_tokens.INIT_PERC_OUT
 
         visual_memory = self.encode_image_to_memory(pixel_values, image_grid_thw)
         vm = visual_memory.unsqueeze(0)
@@ -559,21 +609,61 @@ class ActivePerceptionModel(nn.Module):
 
         labels_dummy = input_ids.clone()
         mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids)
-        mod_ids, mod_mask, _, position_ids = self.build_modified_sequence(
+        mod_ids, mod_mask, dummy_lab, position_ids = self.build_modified_sequence(
             input_ids, mask, labels_dummy
         )
 
+        # Handle initial_perception_mode structural changes
+        if mode == "none":
+            mod_ids, mod_mask, dummy_lab, position_ids = self._remove_token_from_sequences(
+                init_perc_out_id, mod_ids, mod_mask, dummy_lab, position_ids
+            )
+        elif mode == "spatial":
+            spatial_tokens = self._pool_visual_memory(visual_memory, image_grid_thw)
+            n_spatial = self.config.spatial_pool_size ** 2
+            mod_ids, mod_mask, dummy_lab, position_ids = self._splice_spatial_tokens(
+                init_perc_out_id, n_spatial, mod_ids, mod_mask, dummy_lab, position_ids
+            )
+
         current_embeds = self._embed(mod_ids).to(self.dtype)
+
+        # Inject initial visual tokens into the starting embeddings
+        if mode == "spatial":
+            pooled = spatial_tokens.to(self.dtype)
+            for b in range(input_ids.shape[0]):
+                init_pos = (mod_ids[b] == init_perc_out_id).nonzero(as_tuple=True)[0].tolist()
+                for k, pos in enumerate(init_pos):
+                    current_embeds[b, pos, :] = pooled[k]
+        elif mode == "latent":
+            # Warm-up pass: zero INIT_PERC_OUT → get h at IMAGE → compute z_init
+            warm_embeds = current_embeds.clone()
+            warm_embeds[mod_ids == init_perc_out_id] = 0.0
+            warm_out = self._get_inner_transformer()(
+                inputs_embeds=warm_embeds,
+                attention_mask=mod_mask,
+                use_cache=False,
+                output_hidden_states=False,
+            )
+            hs_warm = warm_out.last_hidden_state
+            for b in range(input_ids.shape[0]):
+                img_pos = (mod_ids[b] == self.special_tokens.IMAGE).nonzero(as_tuple=True)[0]
+                if len(img_pos) == 0:
+                    continue
+                h_img = hs_warm[b, img_pos[0].item():img_pos[0].item() + 1, :].unsqueeze(0)
+                z_init, _ = self.perception_module(h_img, vm, return_attn_weights=False)
+                init_pos = (mod_ids[b] == init_perc_out_id).nonzero(as_tuple=True)[0]
+                if len(init_pos) > 0:
+                    current_embeds[b, init_pos[0].item(), :] = (
+                        z_init.squeeze(0).squeeze(0).to(self.dtype)
+                    )
 
         generated_ids = []
         past_key_values = None
-        current_pos_ids = position_ids  # [B, 3, T]
 
         for step in range(max_new_tokens):
-            out = self.base_model.model(
+            out = self._get_inner_transformer()(
                 inputs_embeds=current_embeds,
                 attention_mask=mod_mask,
-                position_ids=current_pos_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
                 output_hidden_states=True,
@@ -621,14 +711,10 @@ class ActivePerceptionModel(nn.Module):
 
                 current_embeds = self._embed(next_token_ids.unsqueeze(1)).to(self.dtype)
 
-            T_current = mod_mask.shape[1] + step + 1
             new_mask_col = torch.ones(
                 input_ids.shape[0], 1, dtype=mod_mask.dtype, device=device
             )
             mod_mask = torch.cat([mod_mask, new_mask_col], dim=1)
-
-            new_pos = current_pos_ids[:, :, -1:] + 1
-            current_pos_ids = new_pos
 
             eos_id = self.tokenizer.eos_token_id
             if eos_id is not None and (next_token_ids == eos_id).all():
@@ -662,6 +748,162 @@ class ActivePerceptionModel(nn.Module):
             if tid != self.tokenizer.unk_token_id:
                 return tid
         return None
+
+    # =========================================================================
+    # Initial perception helpers
+    # =========================================================================
+
+    def _pool_visual_memory(
+        self,
+        visual_memory: torch.Tensor,  # [N, D]
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Adaptive average pool visual_memory to spatial_pool_size × spatial_pool_size.
+
+        Returns: [spatial_pool_size², D]
+        """
+        merge_size = getattr(self.base_model.config.vision_config, "spatial_merge_size", 2)
+        if grid_thw.dim() == 2:
+            _, H_pre, W_pre = grid_thw[0].int().tolist()
+        else:
+            _, H_pre, W_pre = grid_thw.int().tolist()
+        H = int(H_pre) // merge_size
+        W = int(W_pre) // merge_size
+
+        _, D = visual_memory.shape
+        P = self.config.spatial_pool_size
+
+        vm_grid = visual_memory.reshape(H, W, D).permute(2, 0, 1).unsqueeze(0)  # [1, D, H, W]
+        pooled = F.adaptive_avg_pool2d(vm_grid.float(), (P, P))                  # [1, D, P, P]
+        return pooled.squeeze(0).permute(1, 2, 0).reshape(P * P, D).to(visual_memory.dtype)
+
+    def _repad_sequences(
+        self,
+        ids_list: List[torch.Tensor],
+        mask_list: List[torch.Tensor],
+        lab_list: List[torch.Tensor],
+        pos_list: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Re-pad a list of variable-length sequence tensors to max length."""
+        T_max = max(x.shape[0] for x in ids_list)
+        pad_id = self.tokenizer.pad_token_id or 0
+        device = ids_list[0].device
+
+        def pad1d(t, val):
+            p = T_max - t.shape[0]
+            if p == 0:
+                return t
+            return torch.cat([t, torch.full((p,), val, dtype=t.dtype, device=device)])
+
+        def pad_pos(p):
+            pad = T_max - p.shape[1]
+            if pad == 0:
+                return p
+            return F.pad(p, (0, pad), value=0)
+
+        return (
+            torch.stack([pad1d(x, pad_id) for x in ids_list]),
+            torch.stack([pad1d(x, 0) for x in mask_list]),
+            torch.stack([pad1d(x, -100) for x in lab_list]),
+            torch.stack([pad_pos(p) for p in pos_list]),
+        )
+
+    def _remove_token_from_sequences(
+        self,
+        token_id: int,
+        mod_ids: torch.Tensor,
+        mod_mask: torch.Tensor,
+        mod_labels: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Remove all occurrences of token_id from each sequence and re-pad."""
+        B = mod_ids.shape[0]
+        ids_list, mask_list, lab_list, pos_list = [], [], [], []
+        for b in range(B):
+            keep = mod_ids[b] != token_id
+            ids_list.append(mod_ids[b][keep])
+            mask_list.append(mod_mask[b][keep])
+            lab_list.append(mod_labels[b][keep])
+            pos_list.append(position_ids[b][:, keep])
+        return self._repad_sequences(ids_list, mask_list, lab_list, pos_list)
+
+    def _splice_spatial_tokens(
+        self,
+        token_id: int,
+        n_tokens: int,
+        mod_ids: torch.Tensor,
+        mod_mask: torch.Tensor,
+        mod_labels: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Expand the first occurrence of token_id in each sequence to n_tokens copies.
+
+        The placeholder IDs remain as token_id repeated n_tokens times so that
+        training_forward can locate the injection positions via (mod_ids == token_id).
+        Labels for all n_tokens positions are set to -100.
+        Position IDs are recomputed sequentially for the expanded sequence.
+        """
+        B = mod_ids.shape[0]
+        ids_list, mask_list, lab_list, pos_list = [], [], [], []
+        for b in range(B):
+            ids = mod_ids[b]
+            mask = mod_mask[b]
+            lab = mod_labels[b]
+
+            init_pos = (ids == token_id).nonzero(as_tuple=True)[0]
+            if len(init_pos) == 0:
+                ids_list.append(ids)
+                mask_list.append(mask)
+                lab_list.append(lab)
+                pos_list.append(position_ids[b])
+                continue
+
+            p = init_pos[0].item()
+            rep = torch.full((n_tokens,), token_id, dtype=ids.dtype, device=ids.device)
+            new_ids = torch.cat([ids[:p], rep, ids[p + 1:]])
+            new_mask = torch.cat([
+                mask[:p],
+                torch.ones(n_tokens, dtype=mask.dtype, device=mask.device),
+                mask[p + 1:],
+            ])
+            new_lab = torch.cat([
+                lab[:p],
+                torch.full((n_tokens,), -100, dtype=lab.dtype, device=lab.device),
+                lab[p + 1:],
+            ])
+            T_new = new_ids.shape[0]
+            new_pos = torch.arange(T_new, device=ids.device, dtype=torch.long)
+            new_pos = new_pos.unsqueeze(0).expand(3, -1).contiguous()
+
+            ids_list.append(new_ids)
+            mask_list.append(new_mask)
+            lab_list.append(new_lab)
+            pos_list.append(new_pos)
+
+        return self._repad_sequences(ids_list, mask_list, lab_list, pos_list)
+
+    def _get_inner_transformer(self):
+        """
+        Return the inner Qwen2VLModel (backbone without lm_head), unwrapping any
+        peft wrapper.
+
+        Without LoRA: self.base_model = Qwen2_5_VLForConditionalGeneration
+                      .model = Qwen2_5_VLModel  ✓
+        With LoRA:    self.base_model = PeftModelForCausalLM
+                      .base_model    = LoraModel
+                      .model         = Qwen2_5_VLForConditionalGeneration
+                      .model         = Qwen2_5_VLModel  ✓
+        """
+        m = self.base_model
+        try:
+            from peft import PeftModel
+            if isinstance(m, PeftModel):
+                m = m.base_model.model  # LoraModel.model = Qwen2_5_VLForConditionalGeneration
+        except ImportError:
+            pass
+        return m.model
 
     def get_special_token_ids(self) -> Dict[str, int]:
         return self.special_tokens.as_dict()

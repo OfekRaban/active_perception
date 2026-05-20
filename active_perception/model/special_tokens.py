@@ -1,16 +1,23 @@
 """
 Special token management for Active Perception.
 
-Adds <IMAGE>, <PERCEPTION>, <PERC_OUT> to the tokenizer and resizes model embeddings.
+Adds <IMAGE>, <PERCEPTION>, <PERC_OUT>, <INIT_PERC_OUT> to the tokenizer and resizes
+model embeddings.
 
 Token semantics:
-  <IMAGE>      — replaces the full visual-token block in the LLM sequence.
-                 The model sees only this single token where N visual patches used to be.
-                 Visual information is ONLY accessible via <PERCEPTION>.
-  <PERCEPTION> — emitted by the model when it decides to query visual memory.
-                 Its hidden state h_perception drives the cross-attention retrieval.
-  <PERC_OUT>   — placeholder token whose embedding is REPLACED by z_perception
-                 before the second-pass LLM forward. Labels at this position are -100.
+  <IMAGE>        — replaces the full visual-token block in the LLM sequence.
+                   The model sees only this single token where N visual patches used to be.
+                   Visual information is ONLY accessible via <PERCEPTION>.
+  <PERCEPTION>   — emitted by the model when it decides to query visual memory.
+                   Its hidden state h_perception drives the cross-attention retrieval.
+  <PERC_OUT>     — placeholder token whose embedding is REPLACED by z_perception
+                   before the second-pass LLM forward. Labels at this position are -100.
+  <INIT_PERC_OUT> — placeholder at the start of the assistant turn for pre-CoT visual
+                   injection. Behaviour is governed by initial_perception_mode:
+                     "latent"  → replaced by z_init (question-guided visual query)
+                     "spatial" → expanded to spatial_pool_size² pooled visual tokens
+                     "none"    → removed entirely (blind baseline)
+                   Labels at this position are always -100.
 """
 from __future__ import annotations
 import logging
@@ -20,7 +27,7 @@ from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-SPECIAL_TOKENS = ["<IMAGE>", "<PERCEPTION>", "<PERC_OUT>"]
+SPECIAL_TOKENS = ["<IMAGE>", "<PERCEPTION>", "<PERC_OUT>", "<INIT_PERC_OUT>"]
 
 
 class SpecialTokens:
@@ -31,10 +38,11 @@ class SpecialTokens:
         self.IMAGE: int = tokenizer.convert_tokens_to_ids("<IMAGE>")
         self.PERCEPTION: int = tokenizer.convert_tokens_to_ids("<PERCEPTION>")
         self.PERC_OUT: int = tokenizer.convert_tokens_to_ids("<PERC_OUT>")
+        self.INIT_PERC_OUT: int = tokenizer.convert_tokens_to_ids("<INIT_PERC_OUT>")
         self._validate()
 
     def _validate(self):
-        for name in ("IMAGE", "PERCEPTION", "PERC_OUT"):
+        for name in ("IMAGE", "PERCEPTION", "PERC_OUT", "INIT_PERC_OUT"):
             tid = getattr(self, name)
             if tid == self.tokenizer.unk_token_id:
                 raise RuntimeError(
@@ -47,13 +55,15 @@ class SpecialTokens:
             "IMAGE": self.IMAGE,
             "PERCEPTION": self.PERCEPTION,
             "PERC_OUT": self.PERC_OUT,
+            "INIT_PERC_OUT": self.INIT_PERC_OUT,
         }
 
     def __repr__(self) -> str:
         return (
             f"SpecialTokens(IMAGE={self.IMAGE}, "
             f"PERCEPTION={self.PERCEPTION}, "
-            f"PERC_OUT={self.PERC_OUT})"
+            f"PERC_OUT={self.PERC_OUT}, "
+            f"INIT_PERC_OUT={self.INIT_PERC_OUT})"
         )
 
 
@@ -101,10 +111,12 @@ def _initialize_new_embeddings(
     """Initialize embeddings for the new special tokens."""
     embed_layer = model.get_input_embeddings()
 
+    zeros = torch.zeros_like(embed_layer.weight[0])
+
     with torch.no_grad():
         if strategy == "mean_vocab":
             mean_embed = embed_layer.weight.mean(dim=0)
-            for tid in [st.IMAGE, st.PERCEPTION, st.PERC_OUT]:
+            for tid in [st.IMAGE, st.PERCEPTION, st.PERC_OUT, st.INIT_PERC_OUT]:
                 embed_layer.weight[tid] = mean_embed.clone()
             logger.info("[SpecialTokens] Initialized new tokens with mean vocab embedding")
 
@@ -131,8 +143,9 @@ def _initialize_new_embeddings(
             else:
                 embed_layer.weight[st.IMAGE] = embed_layer.weight.mean(dim=0)
 
-            # <PERC_OUT>: initialize to zeros — will always be replaced before LLM sees it
-            embed_layer.weight[st.PERC_OUT] = torch.zeros_like(embed_layer.weight[0])
+            # <PERC_OUT> and <INIT_PERC_OUT>: zeros — always replaced before LLM sees them
+            embed_layer.weight[st.PERC_OUT] = zeros.clone()
+            embed_layer.weight[st.INIT_PERC_OUT] = zeros.clone()
 
             logger.info("[SpecialTokens] Initialized with mean_visual_text strategy")
 
@@ -144,6 +157,8 @@ def _initialize_new_embeddings(
                 return
             for tid in [st.IMAGE, st.PERCEPTION, st.PERC_OUT]:
                 embed_layer.weight[tid] = embed_layer.weight[img_pad_id].clone()
+            # INIT_PERC_OUT always zeros regardless of strategy
+            embed_layer.weight[st.INIT_PERC_OUT] = zeros.clone()
             logger.info("[SpecialTokens] Initialized new tokens with image_pad embedding")
 
         elif strategy == "random":
@@ -153,14 +168,14 @@ def _initialize_new_embeddings(
         else:
             raise ValueError(f"Unknown init_strategy: {strategy}")
 
-    # Also initialize the output (LM head) projection for new tokens
-    # Important: if the LM head is tied to embeddings, this is handled automatically.
+    # Also initialize the output (LM head) projection for new tokens.
+    # If the LM head is tied to embeddings, this is handled automatically.
     # If not tied, initialize the output rows as well.
     lm_head = _get_lm_head(model)
     if lm_head is not None and lm_head.weight.data_ptr() != embed_layer.weight.data_ptr():
         with torch.no_grad():
             mean_lm = lm_head.weight.mean(dim=0)
-            for tid in [st.IMAGE, st.PERCEPTION, st.PERC_OUT]:
+            for tid in [st.IMAGE, st.PERCEPTION, st.PERC_OUT, st.INIT_PERC_OUT]:
                 lm_head.weight[tid] = mean_lm.clone()
         logger.info("[SpecialTokens] Initialized LM head rows for new tokens")
 

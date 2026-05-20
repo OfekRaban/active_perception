@@ -46,3 +46,11 @@ htmlcov/
 # CLAUDE
 .claude/
 CLAUDE.md
+
+outputs/
+outputs
+runs/
+runs
+data/
+data
+configs/

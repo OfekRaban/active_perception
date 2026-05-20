@@ -27,6 +27,7 @@ from torch.utils.data import Dataset
 from PIL import Image
 
 from .schema import ActivePerceptionSample, PerceptionStep
+from .utils import resolve_image_path
 
 logger = logging.getLogger(__name__)
 
@@ -85,16 +86,16 @@ class ActivePerceptionDataset(Dataset):
 
         image = self._load_image(sample.image)
         if image is None:
-            logger.warning(f"[Dataset] Could not load image for sample {sample.id}")
-            return self.__getitem__((idx + 1) % len(self.samples))
+            raise FileNotFoundError(
+                f"[Dataset] Image not found for sample {sample.id}: {sample.image!r}"
+            )
 
         messages = self._build_messages(sample)
 
         try:
             encoding = self._tokenize(messages, image)
         except Exception as e:
-            logger.warning(f"[Dataset] Tokenization failed for {sample.id}: {e}")
-            return self.__getitem__((idx + 1) % len(self.samples))
+            raise RuntimeError(f"[Dataset] Tokenization failed for {sample.id}: {e}") from e
 
         input_ids = encoding["input_ids"][0]
         attention_mask = encoding["attention_mask"][0]
@@ -128,15 +129,14 @@ class ActivePerceptionDataset(Dataset):
         }
 
     def _load_image(self, path: str) -> Optional[Image.Image]:
-        if path == "__bytes__":
-            return None
-        p = Path(path)
-        if not p.is_absolute() and self.image_root:
-            p = self.image_root / p
-        if not p.exists():
+        resolved = resolve_image_path(
+            path,
+            image_root_override=str(self.image_root) if self.image_root else None,
+        )
+        if resolved is None:
             return None
         try:
-            return Image.open(p).convert("RGB")
+            return Image.open(resolved).convert("RGB")
         except Exception:
             return None
 

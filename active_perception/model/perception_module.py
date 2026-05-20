@@ -14,24 +14,16 @@ Architecture:
        │
   OutputProjection + LayerNorm
        │
-       z_visual  [B, K, D_llm]          (pure visual retrieval output)
-       │
-  Learned Scalar Gate                   (gate = sigmoid(W_g @ h_perception))
-       │
-  z_perception = h_perception + gate * z_visual   (gated residual)
-       │
-  z_perception  [B, K, D_llm]          (injected at <PERC_OUT> positions)
+  z_perception  [B, K, D_llm]          (pure visual latent — injected at <PERC_OUT>)
 
-Design choices:
-- NO hard spatial sparsity. The bottleneck is at the OUTPUT level (single z token),
-  not at the attention level. Soft attention allows distributed, multi-focal, and
-  global evidence compression.
+Design:
+- Pure visual latent space. z_perception is the output of cross-attention +
+  projection, with NO residual addition of h_perception. The injected vector
+  lives entirely in the visual evidence manifold; the LLM learns to read it
+  without prior text contamination.
 - attn_weights are returned for diagnostics and optional grounding loss.
-- Gated residual (Issue 5 fix): replaces the hard residual `z = z + h` with a
-  learned scalar gate that controls how much visual evidence supplements the text
-  prior. At init (gate_proj weights=0, bias=0), gate ≈ 0.5. During training the
-  model can specialize toward pure visual retrieval (gate→1) or pure text bypass
-  (gate→0), keeping the injected embedding on a consistent manifold.
+- OutputProjection is initialised with gain=0.1 so early training starts with
+  small perturbations while the QueryAdapter warms up.
 """
 from __future__ import annotations
 import logging
@@ -79,15 +71,15 @@ class QueryAdapter(nn.Module):
 
 class PerceptionModule(nn.Module):
     """
-    Full perception module: QueryAdapter + CrossAttention + OutputProjection + GatedResidual.
+    Full perception module: QueryAdapter → CrossAttention → OutputProjection.
+
+    Returns a pure visual latent z_perception with no text-state blending.
 
     Args:
-        d_model:    LLM hidden dimension (e.g., 3584 for Qwen2.5-7B)
-        d_query:    Bottleneck dimension in QueryAdapter (default: 256)
-        num_heads:  Number of attention heads for cross-attention
-        dropout:    Dropout probability
-        residual:   If True, use a learned scalar gate residual from h_perception.
-                    If False, output is pure visual retrieval (z_visual only).
+        d_model:   LLM hidden dimension (e.g., 3584 for Qwen2.5-7B)
+        d_query:   Bottleneck dimension in QueryAdapter (default: 256)
+        num_heads: Number of attention heads for cross-attention
+        dropout:   Dropout probability
     """
 
     def __init__(
@@ -96,11 +88,9 @@ class PerceptionModule(nn.Module):
         d_query: int = 256,
         num_heads: int = 8,
         dropout: float = 0.0,
-        residual: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
-        self.residual = residual
 
         self.query_adapter = QueryAdapter(d_model, d_query, dropout)
 
@@ -114,22 +104,12 @@ class PerceptionModule(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=True)
         self.layer_norm = nn.LayerNorm(d_model)
 
-        if residual:
-            # Scalar gate: g = sigmoid(W_g h + b_g), init to 0.5 (b_g=0, W_g=0).
-            # Controls how much z_visual supplements h_perception.
-            # Logging gate.mean() over training reveals whether the module is
-            # converging toward visual retrieval (→1) or text bypass (→0).
-            self.gate_proj = nn.Linear(d_model, 1, bias=True)
-            nn.init.zeros_(self.gate_proj.weight)
-            nn.init.zeros_(self.gate_proj.bias)  # sigmoid(0) = 0.5 at init
-
         self._init_output_proj()
 
         num_params = sum(p.numel() for p in self.parameters())
         logger.info(
             f"[PerceptionModule] d_model={d_model}, d_query={d_query}, "
-            f"num_heads={num_heads}, residual={residual} (gated), "
-            f"params={num_params/1e6:.2f}M"
+            f"num_heads={num_heads}, params={num_params/1e6:.2f}M"
         )
 
     def _init_output_proj(self):
@@ -153,7 +133,7 @@ class PerceptionModule(nn.Module):
             return_attn_weights: Whether to return attention weights for diagnostics.
 
         Returns:
-            z_perception:  [B, K, D] — latent visual evidence tokens
+            z_perception:  [B, K, D] — pure visual latent (no h_perception blending)
             attn_weights:  [B, K, N] — averaged over heads (or None)
         """
         unbatched = h_perception.dim() == 2
@@ -163,7 +143,7 @@ class PerceptionModule(nn.Module):
 
         B, K, D = h_perception.shape
 
-        # 1. Query adapter: compress h_perception into structured query
+        # 1. Query adapter: compress h_perception into a structured query
         q = self.query_adapter(h_perception)  # [B, K, D]
 
         # 2. Cross-attention over visual memory
@@ -178,22 +158,9 @@ class PerceptionModule(nn.Module):
             need_weights=return_attn_weights,
             average_attn_weights=True,
         )
-        # z_raw: [B, K, D]
 
-        # 3. Output projection + LayerNorm → pure visual retrieval signal
-        z_visual = self.out_proj(z_raw)
-        z_visual = self.layer_norm(z_visual)  # [B, K, D]
-
-        # 4. Gated residual from h_perception (Issue 5 fix).
-        #    z = h + sigmoid(W_g @ h) * z_visual
-        #    At init: gate ≈ 0.5 → z ≈ h + 0.5 * z_visual (stable, in-manifold).
-        #    The gate decouples the visual retrieval space from the text space:
-        #    z_visual is the visual evidence; h is the text prior; gate is learned.
-        if self.residual:
-            gate = torch.sigmoid(self.gate_proj(h_perception))  # [B, K, 1]
-            z = h_perception + gate * z_visual
-        else:
-            z = z_visual
+        # 3. Output projection + LayerNorm → pure visual latent
+        z = self.layer_norm(self.out_proj(z_raw))  # [B, K, D]
 
         if unbatched:
             z = z.squeeze(0)

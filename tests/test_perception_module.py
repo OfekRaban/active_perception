@@ -33,7 +33,7 @@ class TestQueryAdapter:
 
 class TestPerceptionModule:
     def setup_method(self):
-        self.module = PerceptionModule(D_MODEL, D_QUERY, N_HEADS, residual=True)
+        self.module = PerceptionModule(D_MODEL, D_QUERY, N_HEADS)
 
     def test_batched_forward_shapes(self):
         h = torch.randn(B, K, D_MODEL)
@@ -78,18 +78,19 @@ class TestPerceptionModule:
         assert z.shape == (B, K2, D_MODEL)
         assert attn.shape == (B, K2, N_PATCHES)
 
-    def test_residual_makes_z_closer_to_h(self):
-        """With residual=True, z should be closer to h than without."""
-        mod_res = PerceptionModule(D_MODEL, D_QUERY, N_HEADS, residual=True)
-        mod_no_res = PerceptionModule(D_MODEL, D_QUERY, N_HEADS, residual=False)
-        h = torch.randn(B, K, D_MODEL)
+    def test_output_independent_of_h_scale(self):
+        """z_perception must not scale with h — it is a pure visual latent."""
+        mod = PerceptionModule(D_MODEL, D_QUERY, N_HEADS)
         mem = torch.randn(B, N_PATCHES, D_MODEL)
-        z_res, _ = mod_res(h, mem)
-        z_no, _ = mod_no_res(h, mem)
-        dist_res = (z_res - h).norm()
-        dist_no = (z_no - h).norm()
-        # Residual should keep z closer to h (smaller perturbation at init)
-        assert dist_res <= dist_no + 0.5  # allow small tolerance at random init
+        h_small = torch.randn(B, K, D_MODEL) * 0.01
+        h_large = h_small * 1000.0
+        z_small, _ = mod(h_small, mem)
+        z_large, _ = mod(h_large, mem)
+        # The query changes (different h → different attention), but z should not
+        # simply scale with h magnitude since there is no residual addition.
+        # Confirm z_large is not just 1000× z_small (which a pure residual would cause).
+        ratio = (z_large.norm() / (z_small.norm() + 1e-8)).item()
+        assert ratio < 500.0, f"z scales too strongly with h magnitude (ratio={ratio:.1f})"
 
 
 class TestSpatialEncoding2D:
@@ -105,23 +106,23 @@ class TestSpatialEncoding2D:
     def test_additive_sincos2d_shape(self):
         enc = SpatialEncoding2D(D_MODEL, SpatialEncodingMode.ADDITIVE_SINCOS2D)
         mem = torch.randn(N_PATCHES, D_MODEL)
-        out = enc(mem, self._make_grid_thw(7, 7))
+        out = enc(mem, self._make_grid_thw(14, 14))  # pre-merger 14x14 → post-merger 7x7=49
         assert out.shape == (N_PATCHES, D_MODEL)
 
     def test_concat_sincos2d_shape(self):
         enc = SpatialEncoding2D(D_MODEL, SpatialEncodingMode.CONCAT_SINCOS2D)
         mem = torch.randn(N_PATCHES, D_MODEL)
-        out = enc(mem, self._make_grid_thw(7, 7))
+        out = enc(mem, self._make_grid_thw(14, 14))  # pre-merger 14x14 → post-merger 7x7=49
         assert out.shape == (N_PATCHES, D_MODEL)
 
     def test_batched_additive(self):
         enc = SpatialEncoding2D(D_MODEL, SpatialEncodingMode.ADDITIVE_SINCOS2D)
         mem = torch.randn(B, N_PATCHES, D_MODEL)
-        out = enc(mem, self._make_grid_thw(7, 7))
+        out = enc(mem, self._make_grid_thw(14, 14))  # pre-merger 14x14 → post-merger 7x7=49
         assert out.shape == (B, N_PATCHES, D_MODEL)
 
     def test_pe_not_all_zeros(self):
         enc = SpatialEncoding2D(D_MODEL, SpatialEncodingMode.ADDITIVE_SINCOS2D)
         mem = torch.zeros(N_PATCHES, D_MODEL)
-        out = enc(mem, self._make_grid_thw(7, 7))
+        out = enc(mem, self._make_grid_thw(14, 14))  # pre-merger 14x14 → post-merger 7x7=49
         assert out.abs().sum() > 0  # PE was added

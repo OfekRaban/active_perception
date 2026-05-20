@@ -2,12 +2,70 @@
 from __future__ import annotations
 import logging
 from pathlib import Path
-from typing import Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List
 
 import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Image path resolution
+# ---------------------------------------------------------------------------
+
+# Known dataset prefix → local root directory.
+# VGR image paths are relative: "<prefix>/images/<file>".
+# resolved path = IMAGE_ROOTS[prefix] / "<prefix>/images/<file>"[len(prefix)+1:]
+IMAGE_ROOTS: Dict[str, str] = {
+    "gqa":      "/cortex/data/images/GQA",
+    # Add more as images become available on the server:
+    # "coco":     "/cortex/data/images/COCO",
+    # "ocr_vqa":  "/cortex/data/images/ocr_vqa",
+    # "dvqa":     "/cortex/data/images/dvqa",
+    # "chartqa":  "/cortex/data/images/chartqa",
+    # "ai2d":     "/cortex/data/images/ai2d",
+}
+
+
+def resolve_image_path(
+    image_path: str,
+    image_roots: Optional[Dict[str, str]] = None,
+    image_root_override: Optional[str] = None,
+) -> Optional[Path]:
+    """
+    Resolve a VGR relative image path to an absolute path that exists on disk.
+
+    Resolution order:
+      1. Absolute path → return as-is if it exists.
+      2. image_root_override / image_path → if override given.
+      3. IMAGE_ROOTS[prefix] / rest_of_path → prefix-mapped lookup.
+
+    Returns None if the resolved path does not exist.
+    """
+    if not image_path or image_path == "__bytes__":
+        return None
+
+    p = Path(image_path)
+
+    if p.is_absolute():
+        return p if p.exists() else None
+
+    if image_root_override:
+        resolved = Path(image_root_override) / p
+        if resolved.exists():
+            return resolved
+
+    roots = image_roots if image_roots is not None else IMAGE_ROOTS
+    parts = p.parts
+    if parts:
+        prefix = parts[0]
+        if prefix in roots:
+            resolved = Path(roots[prefix]) / Path(*parts[1:])
+            if resolved.exists():
+                return resolved
+
+    return None
 
 
 # ---------------------------------------------------------------------------

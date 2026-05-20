@@ -1,2 +1,2 @@
-from .losses import LossConfig, compute_losses, LossOutput
+from .losses import LossConfig, LossOutput
 from .trainer import ActivePerceptionTrainer, TrainerConfig
