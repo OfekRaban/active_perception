@@ -1,0 +1,48 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local Claude settings (per-user)
+.claude/settings.local.json
+
+# Experiment outputs and data
+runs/
+checkpoints/
+wandb/
+data/
+*.pt
+*.bin
+*.safetensors
+
+# Logs
+*.log
+logs/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# CLAUDE
+.claude/
+CLAUDE.md
